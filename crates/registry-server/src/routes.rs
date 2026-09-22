@@ -21,7 +21,9 @@ use axum::{
 use base64::{Engine as _, engine::general_purpose::STANDARD};
 use hmac::{Hmac, Mac};
 use registry_auth::parse_scope;
-use registry_core::{Action, Digest, OCI_IMAGE_INDEX, RepositoryName, RepositoryScope};
+use registry_core::{
+    Action, Digest, OCI_IMAGE_INDEX, RepositoryName, RepositoryScope, validate_manifest,
+};
 use serde::Deserialize;
 use serde_json::json;
 use sha2::Sha256;
@@ -151,8 +153,15 @@ async fn oci_route(State(state): State<AppState>, request: Request<Body>) -> Res
         );
     };
     let (repository, action) = match &parsed {
-        OciPath::Manifest { repository, .. }
-        | OciPath::Blob { repository, .. }
+        OciPath::Manifest { repository, .. } => (
+            repository,
+            match *request.method() {
+                Method::DELETE => Action::Delete,
+                Method::PUT => Action::Push,
+                _ => Action::Pull,
+            },
+        ),
+        OciPath::Blob { repository, .. }
         | OciPath::Tags { repository }
         | OciPath::Referrers { repository, .. } => (
             repository,
@@ -188,6 +197,8 @@ async fn oci_route(State(state): State<AppState>, request: Request<Body>) -> Res
         } => {
             if request.method() == Method::DELETE {
                 delete_manifest_response(&state, &repository, &reference).await
+            } else if request.method() == Method::PUT {
+                put_manifest_response(&state, &repository, &reference, request).await
             } else {
                 manifest_response(&state, &repository, &reference, head).await
             }
@@ -212,6 +223,99 @@ async fn oci_route(State(state): State<AppState>, request: Request<Body>) -> Res
         }
         OciPath::Upload { repository, id } => upload_session(&state, repository, id, request).await,
     }
+}
+
+async fn put_manifest_response(
+    state: &AppState,
+    repository: &RepositoryName,
+    reference: &str,
+    request: Request<Body>,
+) -> Response {
+    let content_type = request
+        .headers()
+        .get(CONTENT_TYPE)
+        .and_then(|value| value.to_str().ok())
+        .map(str::to_owned);
+    let body = match to_body(request, state.config.request_body_limit_bytes).await {
+        Ok(body) => body,
+        Err(response) => return response,
+    };
+    let info = match validate_manifest(&body, content_type.as_deref()) {
+        Ok(info) => info,
+        Err(error) => {
+            return oci_error(
+                StatusCode::BAD_REQUEST,
+                "MANIFEST_INVALID",
+                &error.to_string(),
+            );
+        }
+    };
+    let digest = Digest::sha256(&body);
+    if let Ok(requested_digest) = Digest::parse(reference)
+        && requested_digest != digest
+    {
+        return oci_error(
+            StatusCode::BAD_REQUEST,
+            "DIGEST_INVALID",
+            "manifest bytes do not match the digest reference",
+        );
+    }
+    for descriptor in &info.references {
+        let has_blob = state
+            .catalog
+            .blob_visible(repository, &descriptor.digest)
+            .await;
+        let has_manifest = state
+            .catalog
+            .resolve_manifest(repository, descriptor.digest.as_str())
+            .await
+            .is_ok();
+        if !has_blob && !has_manifest {
+            return oci_error(
+                StatusCode::NOT_FOUND,
+                "BLOB_UNKNOWN",
+                "a manifest descriptor is not available in this repository",
+            );
+        }
+    }
+    if let Err(error) = state.store.put(&manifest_key(&digest), body.clone()).await {
+        tracing::error!(error = %error, digest = %digest, "manifest object write failed");
+        return oci_error(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "UNKNOWN",
+            "manifest storage failed",
+        );
+    }
+    let manifest = match state
+        .catalog
+        .publish_manifest(repository, reference, &body, content_type.as_deref())
+        .await
+    {
+        Ok(manifest) => manifest,
+        Err(error) => {
+            let _ = state.store.delete(&manifest_key(&digest)).await;
+            return oci_error(
+                StatusCode::BAD_REQUEST,
+                "MANIFEST_INVALID",
+                &error.to_string(),
+            );
+        }
+    };
+    let mut response = StatusCode::CREATED.into_response();
+    response.headers_mut().insert(
+        LOCATION,
+        HeaderValue::from_str(&format!("/v2/{repository}/manifests/{}", manifest.digest))
+            .expect("manifest location is valid"),
+    );
+    response.headers_mut().insert(
+        HeaderName::from_static("docker-content-digest"),
+        HeaderValue::from_str(manifest.digest.as_str()).expect("digest is valid"),
+    );
+    response
+        .headers_mut()
+        .insert(CONTENT_LENGTH, HeaderValue::from_static("0"));
+    add_protocol_headers(&mut response);
+    response
 }
 
 fn parse_oci_path(path: &str) -> Option<OciPath> {
@@ -1401,6 +1505,92 @@ mod tests {
                 .contains("sig=")
         );
         assert_eq!(response.headers()["docker-content-digest"], digest.as_str());
+    }
+
+    #[tokio::test]
+    async fn manifest_put_requires_push_and_preserves_exact_bytes() {
+        let state = AppState::initialize(test_config()).await.expect("state");
+        let user = state
+            .auth
+            .bootstrap_admin("admin", "correct horse battery staple")
+            .await
+            .expect("bootstrap");
+        let credential = state
+            .auth
+            .issue_credential_for_user(
+                user.id,
+                "push".to_owned(),
+                vec![parse_scope("repository:team/app:pull,push").expect("scope")],
+                None,
+            )
+            .await
+            .expect("credential");
+        let bearer = state
+            .auth
+            .mint_token(
+                "admin",
+                &credential.secret,
+                "knotree-registry",
+                &[parse_scope("repository:team/app:pull,push").expect("scope")],
+            )
+            .await
+            .expect("bearer")
+            .token;
+        let repository = RepositoryName::parse("team/app").expect("repository");
+        let config = Bytes::from_static(b"config");
+        let config_digest = Digest::sha256(&config);
+        state
+            .store
+            .put(&blob_key(&config_digest), config.clone())
+            .await
+            .expect("config object");
+        state
+            .catalog
+            .attach_blob(&repository, config_digest.clone())
+            .await;
+        let raw = Bytes::from(format!(
+            r#"{{"schemaVersion":2,"mediaType":"application/vnd.oci.image.manifest.v1+json","config":{{"mediaType":"application/vnd.oci.image.config.v1+json","digest":"{config_digest}","size":6}},"layers":[]}}"#
+        ));
+        let digest = Digest::sha256(&raw);
+        let response = router(state.clone())
+            .oneshot(
+                Request::builder()
+                    .method("PUT")
+                    .uri("/v2/team/app/manifests/latest")
+                    .header("authorization", format!("Bearer {bearer}"))
+                    .header("content-type", "application/vnd.oci.image.manifest.v1+json")
+                    .body(Body::from(raw.clone()))
+                    .expect("request"),
+            )
+            .await
+            .expect("response");
+        assert_eq!(response.status(), StatusCode::CREATED);
+        assert_eq!(response.headers()["docker-content-digest"], digest.as_str());
+        assert_eq!(
+            state
+                .store
+                .get(&manifest_key(&digest))
+                .await
+                .expect("manifest"),
+            raw
+        );
+
+        let wrong_digest = Digest::sha256(b"different");
+        let response = router(state)
+            .oneshot(
+                Request::builder()
+                    .method("PUT")
+                    .uri(format!("/v2/team/app/manifests/{wrong_digest}"))
+                    .header("authorization", format!("Bearer {bearer}"))
+                    .header("content-type", "application/vnd.oci.image.manifest.v1+json")
+                    .body(Body::from(
+                        r#"{"schemaVersion":2,"mediaType":"application/vnd.oci.image.manifest.v1+json","config":{"mediaType":"application/vnd.oci.image.config.v1+json","digest":"sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","size":0},"layers":[]}"#,
+                    ))
+                    .expect("request"),
+            )
+            .await
+            .expect("response");
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
     }
 
     #[tokio::test]
