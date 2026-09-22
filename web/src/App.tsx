@@ -183,7 +183,7 @@ function Shell() {
     return () => window.removeEventListener("keydown", onKey);
   }, []);
   if (!user) return <div className="auth-shell">Loading workspace…</div>;
-  const host = instance?.registry_host ?? "registry.knotree.org";
+  const host = instance?.registry_host ?? "registry.knotree.com";
   const visible = nav
     .map((group) => ({
       ...group,
@@ -445,7 +445,7 @@ function AccountSecurityRoute() {
 }
 
 function useHost(): string {
-  const [host, setHost] = useState("registry.knotree.org");
+  const [host, setHost] = useState("registry.knotree.com");
   useEffect(() => {
     api<Instance>("/api/v1/instance")
       .then((instance) => setHost(instance.registry_host))

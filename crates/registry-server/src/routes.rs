@@ -1273,9 +1273,9 @@ async fn instance(
         Some(url) => match (url.host_str(), url.port()) {
             (Some(host), Some(port)) => format!("{host}:{port}"),
             (Some(host), None) => host.to_owned(),
-            _ => "registry.knotree.org".to_owned(),
+            _ => "registry.knotree.com".to_owned(),
         },
-        None => "registry.knotree.org".to_owned(),
+        None => "registry.knotree.com".to_owned(),
     };
     Ok(Json(json!({
         "public_url": state.config.public_url,

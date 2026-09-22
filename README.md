@@ -30,7 +30,7 @@ curl http://127.0.0.1:8080/v2/
 
 ## Production deployment
 
-The production image builds the React dashboard and serves it from the same Axum process, so the Cloudflare Tunnel should target `http://127.0.0.1:8080`. Copy `deploy/.env.example` to a secret-managed environment file, replace every placeholder, and start the stack:
+The production image builds the React dashboard and serves it from the same Axum process, so the Cloudflare edge should route `registry.knotree.com` to the k3s Nginx edge. Copy `deploy/.env.example` to a secret-managed environment file, replace every placeholder, and start the stack:
 
 ```powershell
 docker compose --env-file deploy/.env -f deploy/docker-compose.yml up -d --build

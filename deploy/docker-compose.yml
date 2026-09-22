@@ -23,7 +23,7 @@ services:
     environment:
       APP_ENV: production
       BIND_ADDR: 0.0.0.0:8080
-      PUBLIC_REGISTRY_URL: ${PUBLIC_REGISTRY_URL:?Set PUBLIC_REGISTRY_URL, for example https://registry.knotree.org}
+      PUBLIC_REGISTRY_URL: ${PUBLIC_REGISTRY_URL:?Set PUBLIC_REGISTRY_URL, for example https://registry.knotree.com}
       DATABASE_URL: ${DATABASE_URL:?Set DATABASE_URL with a URL-encoded password}
       DATABASE_MAX_CONNECTIONS: ${DATABASE_MAX_CONNECTIONS:-10}
       REQUIRE_DATABASE: "true"
