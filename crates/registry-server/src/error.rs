@@ -16,6 +16,8 @@ pub enum AppError {
     Storage(#[from] registry_storage::StorageError),
     #[error("database error: {0}")]
     Database(#[from] registry_db::DatabaseError),
+    #[error("catalog error: {0}")]
+    Catalog(#[from] crate::CatalogError),
     #[error("bad request: {0}")]
     BadRequest(&'static str),
 }
@@ -29,6 +31,9 @@ impl IntoResponse for AppError {
             | Self::Auth(registry_auth::AuthError::CredentialExpired)
             | Self::Auth(registry_auth::AuthError::Bearer) => StatusCode::UNAUTHORIZED,
             Self::Auth(registry_auth::AuthError::NoAccess) => StatusCode::FORBIDDEN,
+            Self::Catalog(crate::CatalogError::NotFound) => StatusCode::NOT_FOUND,
+            Self::Catalog(crate::CatalogError::InvalidTag)
+            | Self::Catalog(crate::CatalogError::Manifest(_)) => StatusCode::BAD_REQUEST,
             Self::BadRequest(_) | Self::Auth(registry_auth::AuthError::InvalidScope) => {
                 StatusCode::BAD_REQUEST
             }

@@ -17,7 +17,7 @@ use axum::{
 };
 use base64::{Engine as _, engine::general_purpose::STANDARD};
 use registry_auth::parse_scope;
-use registry_core::{Action, Digest, RepositoryName, RepositoryScope};
+use registry_core::{Action, Digest, OCI_IMAGE_INDEX, RepositoryName, RepositoryScope};
 use serde::Deserialize;
 use serde_json::json;
 use tower_http::trace::TraceLayer;
@@ -41,6 +41,7 @@ pub fn router(state: AppState) -> Router {
         .route("/api/v1/auth/me", get(me))
         .route("/api/v1/auth/tokens", post(create_token))
         .route("/api/v1/auth/tokens/{id}/revoke", post(revoke_token))
+        .route("/api/v1/admin/gc", post(run_gc))
         .with_state(state)
         .layer(middleware::from_fn(request_id))
         .layer(TraceLayer::new_for_http())
@@ -105,6 +106,10 @@ enum OciPath {
     Tags {
         repository: RepositoryName,
     },
+    Referrers {
+        repository: RepositoryName,
+        digest: String,
+    },
     UploadStart {
         repository: RepositoryName,
     },
@@ -140,7 +145,15 @@ async fn oci_route(State(state): State<AppState>, request: Request<Body>) -> Res
     let (repository, action) = match &parsed {
         OciPath::Manifest { repository, .. }
         | OciPath::Blob { repository, .. }
-        | OciPath::Tags { repository } => (repository, Action::Pull),
+        | OciPath::Tags { repository }
+        | OciPath::Referrers { repository, .. } => (
+            repository,
+            if request.method() == Method::DELETE {
+                Action::Delete
+            } else {
+                Action::Pull
+            },
+        ),
         OciPath::UploadStart { repository } | OciPath::Upload { repository, .. } => {
             (repository, Action::Push)
         }
@@ -164,7 +177,13 @@ async fn oci_route(State(state): State<AppState>, request: Request<Body>) -> Res
         OciPath::Manifest {
             repository,
             reference,
-        } => manifest_response(&state, &repository, &reference, head).await,
+        } => {
+            if request.method() == Method::DELETE {
+                delete_manifest_response(&state, &repository, &reference).await
+            } else {
+                manifest_response(&state, &repository, &reference, head).await
+            }
+        }
         OciPath::Blob { repository, digest } => {
             blob_response(&state, &repository, &digest, head).await
         }
@@ -176,6 +195,9 @@ async fn oci_route(State(state): State<AppState>, request: Request<Body>) -> Res
                 request.method() == Method::HEAD,
             )
             .await
+        }
+        OciPath::Referrers { repository, digest } => {
+            referrers_response(&state, &repository, &digest).await
         }
         OciPath::UploadStart { repository } => {
             upload_start(&state, repository, &token, request).await
@@ -196,6 +218,12 @@ fn parse_oci_path(path: &str) -> Option<OciPath> {
             id: Uuid::parse_str(id).ok()?,
         });
     }
+    if let Some((repository, digest)) = path.rsplit_once("/referrers/") {
+        return Some(OciPath::Referrers {
+            repository: RepositoryName::parse(repository).ok()?,
+            digest: digest.to_owned(),
+        });
+    }
     if let Some((repository, reference)) = path.rsplit_once("/manifests/") {
         return Some(OciPath::Manifest {
             repository: RepositoryName::parse(repository).ok()?,
@@ -214,6 +242,84 @@ fn parse_oci_path(path: &str) -> Option<OciPath> {
         });
     }
     None
+}
+
+async fn delete_manifest_response(
+    state: &AppState,
+    repository: &RepositoryName,
+    reference: &str,
+) -> Response {
+    match state.catalog.delete_manifest(repository, reference).await {
+        Ok(manifest) => {
+            let mut response = StatusCode::ACCEPTED.into_response();
+            response.headers_mut().insert(
+                HeaderName::from_static("docker-content-digest"),
+                HeaderValue::from_str(manifest.digest.as_str()).expect("digest is valid"),
+            );
+            add_protocol_headers(&mut response);
+            response
+        }
+        Err(crate::CatalogError::NotFound) => oci_error(
+            StatusCode::NOT_FOUND,
+            "MANIFEST_UNKNOWN",
+            "manifest was not found",
+        ),
+        Err(_) => oci_error(
+            StatusCode::BAD_REQUEST,
+            "MANIFEST_INVALID",
+            "manifest reference is invalid",
+        ),
+    }
+}
+
+async fn referrers_response(
+    state: &AppState,
+    repository: &RepositoryName,
+    value: &str,
+) -> Response {
+    let subject = match Digest::parse(value) {
+        Ok(digest) => digest,
+        Err(_) => {
+            return oci_error(
+                StatusCode::BAD_REQUEST,
+                "DIGEST_INVALID",
+                "digest is invalid",
+            );
+        }
+    };
+    let manifests = match state.catalog.referrers(repository, &subject).await {
+        Ok(manifests) => manifests,
+        Err(crate::CatalogError::NotFound) => {
+            return oci_error(
+                StatusCode::NOT_FOUND,
+                "NAME_UNKNOWN",
+                "repository was not found",
+            );
+        }
+        Err(_) => {
+            return oci_error(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "UNKNOWN",
+                "catalog failure",
+            );
+        }
+    };
+    let body = serde_json::to_vec(&json!({
+        "schemaVersion": 2,
+        "mediaType": OCI_IMAGE_INDEX,
+        "manifests": manifests.into_iter().map(|manifest| json!({"mediaType": manifest.media_type, "digest": manifest.digest, "size": manifest.size})).collect::<Vec<_>>(),
+    })).expect("referrers response is serializable");
+    let mut response = content_response(
+        StatusCode::OK,
+        bytes::Bytes::from(body),
+        false,
+        "application/json",
+        &Digest::sha256(&[]),
+        None,
+        None,
+    );
+    response.headers_mut().remove("docker-content-digest");
+    response
 }
 
 async fn upload_start(
@@ -746,9 +852,6 @@ async fn token(
         .flat_map(|value| value.split_whitespace())
         .map(parse_scope)
         .collect::<Result<Vec<_>, _>>()?;
-    if requested.is_empty() {
-        return Err(crate::AppError::BadRequest("scope is required"));
-    }
     let minted = state
         .auth
         .mint_token(&username, &password, service, &requested)
@@ -859,6 +962,34 @@ async fn revoke_token(
         .revoke_credential_for_session(session, id)
         .await?;
     Ok(StatusCode::NO_CONTENT)
+}
+
+#[derive(Debug, Deserialize)]
+struct GcRequest {
+    #[serde(default)]
+    dry_run: bool,
+    grace_seconds: Option<u64>,
+}
+
+async fn run_gc(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Json(input): Json<GcRequest>,
+) -> Result<impl IntoResponse, crate::AppError> {
+    let session = cookie_value(&headers).ok_or(registry_auth::AuthError::InvalidSession)?;
+    let user = state.auth.session_user(session).await?;
+    if !user.is_admin {
+        return Err(registry_auth::AuthError::NoAccess.into());
+    }
+    let report = state
+        .catalog
+        .garbage_collect(
+            &state.store,
+            std::time::Duration::from_secs(input.grace_seconds.unwrap_or(7 * 24 * 60 * 60)),
+            input.dry_run,
+        )
+        .await?;
+    Ok(Json(report))
 }
 
 fn basic_credentials(headers: &HeaderMap) -> Option<(String, String)> {
@@ -1157,5 +1288,98 @@ mod tests {
                 )
                 .await
         );
+    }
+
+    #[tokio::test]
+    async fn referrers_and_delete_use_manifest_relationships() {
+        let state = AppState::initialize(test_config()).await.expect("state");
+        let user = state
+            .auth
+            .bootstrap_admin("admin", "correct horse battery staple")
+            .await
+            .expect("bootstrap");
+        let credential = state
+            .auth
+            .issue_credential_for_user(
+                user.id,
+                "maintainer".to_owned(),
+                vec![parse_scope("repository:team/app:pull,delete").expect("scope")],
+                None,
+            )
+            .await
+            .expect("credential");
+        let bearer = state
+            .auth
+            .mint_token(
+                "admin",
+                &credential.secret,
+                "knotree-registry",
+                &[parse_scope("repository:team/app:pull,delete").expect("scope")],
+            )
+            .await
+            .expect("bearer")
+            .token;
+        let repository = RepositoryName::parse("team/app").expect("repository");
+        let base = Bytes::from_static(
+            br#"{"schemaVersion":2,"mediaType":"application/vnd.oci.image.manifest.v1+json","config":{"mediaType":"application/vnd.oci.image.config.v1+json","digest":"sha256:0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef","size":0},"layers":[]}"#,
+        );
+        let base_record = state
+            .catalog
+            .publish_manifest(&repository, "latest", &base, None)
+            .await
+            .expect("base manifest");
+        state
+            .store
+            .put(&manifest_key(&base_record.digest), base)
+            .await
+            .expect("base object");
+        let referrer = Bytes::from(format!(
+            r#"{{"schemaVersion":2,"mediaType":"application/vnd.oci.artifact.manifest.v1+json","artifactType":"application/example.sbom","blobs":[],"subject":{{"mediaType":"application/vnd.oci.image.manifest.v1+json","digest":"{}","size":0}}}}"#,
+            base_record.digest
+        ));
+        let referrer_digest = Digest::sha256(&referrer);
+        let referrer_record = state
+            .catalog
+            .publish_manifest(&repository, &referrer_digest.to_string(), &referrer, None)
+            .await
+            .expect("referrer");
+        state
+            .store
+            .put(&manifest_key(&referrer_record.digest), referrer)
+            .await
+            .expect("referrer object");
+
+        let response = router(state.clone())
+            .oneshot(
+                Request::builder()
+                    .uri(format!("/v2/team/app/referrers/{}", base_record.digest))
+                    .header("authorization", format!("Bearer {bearer}"))
+                    .body(Body::empty())
+                    .expect("request"),
+            )
+            .await
+            .expect("response");
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = to_bytes(response.into_body(), usize::MAX)
+            .await
+            .expect("body");
+        assert!(String::from_utf8_lossy(&body).contains(referrer_record.digest.as_str()));
+
+        let response = router(state.clone())
+            .oneshot(
+                Request::builder()
+                    .method("DELETE")
+                    .uri("/v2/team/app/manifests/latest")
+                    .header("authorization", format!("Bearer {bearer}"))
+                    .body(Body::empty())
+                    .expect("request"),
+            )
+            .await
+            .expect("response");
+        assert_eq!(response.status(), StatusCode::ACCEPTED);
+        assert!(matches!(
+            state.catalog.resolve_manifest(&repository, "latest").await,
+            Err(crate::CatalogError::NotFound)
+        ));
     }
 }

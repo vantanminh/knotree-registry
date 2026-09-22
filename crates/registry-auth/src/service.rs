@@ -343,7 +343,11 @@ impl AuthService {
                 credential.expires_at,
             )
         };
-        let access = intersect_scopes(&scopes, requested);
+        let access = if requested.is_empty() {
+            scopes_to_access(&scopes)
+        } else {
+            intersect_scopes(&scopes, requested)
+        };
         if access.is_empty() {
             return Err(AuthError::NoAccess);
         }
@@ -474,6 +478,17 @@ fn intersect_scopes(actual: &[RepositoryScope], requested: &[RepositoryScope]) -
                 name: wanted.repository.to_string(),
                 actions,
             })
+        })
+        .collect()
+}
+
+fn scopes_to_access(scopes: &[RepositoryScope]) -> Vec<AccessEntry> {
+    scopes
+        .iter()
+        .map(|scope| AccessEntry {
+            typ: "repository".to_owned(),
+            name: scope.repository.to_string(),
+            actions: scope.actions.iter().map(ToString::to_string).collect(),
         })
         .collect()
 }

@@ -5,6 +5,7 @@ use crate::Digest;
 
 pub const OCI_IMAGE_MANIFEST: &str = "application/vnd.oci.image.manifest.v1+json";
 pub const OCI_IMAGE_INDEX: &str = "application/vnd.oci.image.index.v1+json";
+pub const OCI_ARTIFACT_MANIFEST: &str = "application/vnd.oci.artifact.manifest.v1+json";
 pub const DOCKER_MANIFEST: &str = "application/vnd.docker.distribution.manifest.v2+json";
 pub const DOCKER_MANIFEST_LIST: &str = "application/vnd.docker.distribution.manifest.list.v2+json";
 
@@ -19,6 +20,7 @@ pub struct Descriptor {
 pub struct ManifestInfo {
     pub media_type: String,
     pub references: Vec<Descriptor>,
+    pub subject: Option<Descriptor>,
 }
 
 #[derive(Debug, Error, Clone, PartialEq, Eq)]
@@ -62,20 +64,28 @@ pub fn validate_manifest(
         .to_owned();
     let is_index = matches!(media_type.as_str(), OCI_IMAGE_INDEX | DOCKER_MANIFEST_LIST);
     let is_manifest = matches!(media_type.as_str(), OCI_IMAGE_MANIFEST | DOCKER_MANIFEST);
-    if !is_index && !is_manifest {
+    let is_artifact = media_type == OCI_ARTIFACT_MANIFEST;
+    if !is_index && !is_manifest && !is_artifact {
         return Err(ManifestError::UnsupportedMediaType(media_type));
     }
     let references = if is_index {
         descriptors(object.get("manifests"), "manifests")?
-    } else {
+    } else if is_manifest {
         let mut references = Vec::new();
         references.push(descriptor(object.get("config"), "config")?);
         references.extend(descriptors(object.get("layers"), "layers")?);
         references
+    } else {
+        descriptors(object.get("blobs"), "blobs")?
     };
+    let subject = object
+        .get("subject")
+        .map(|value| descriptor(Some(value), "subject"))
+        .transpose()?;
     Ok(ManifestInfo {
         media_type,
         references,
+        subject,
     })
 }
 
