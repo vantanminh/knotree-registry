@@ -69,10 +69,14 @@ k3s kubectl -n "$namespace" rollout status deployment/registry --timeout=180s
 k3s kubectl -n "$namespace" get pods,svc,pvc
 ```
 
-Create a proxied DNS `A` record for `registry.knotree.com` pointing to
-`15.235.210.66` (or add the hostname to the existing Cloudflare Tunnel and
-point it at the Nginx edge). The public certificate already covers
-`*.knotree.com`; Cloudflare should use Full (strict) TLS to the origin.
+The existing `K3s Ovh` Cloudflare Tunnel is already configured with
+`registry.knotree.com` as an ingress to `https://localhost:443` (the Nginx
+edge). To publish it, create a proxied DNS `CNAME` for
+`registry.knotree.com` pointing to
+`09908a97-8f92-4a01-ad69-4a82244943fd.cfargotunnel.com`. If DNS is managed
+without the tunnel, a proxied `A` record to `15.235.210.66` is also supported.
+The public certificate already covers `*.knotree.com`; direct-origin
+Cloudflare traffic should use Full (strict) TLS.
 
 ## R2 configuration
 
