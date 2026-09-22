@@ -20,6 +20,8 @@ pub enum CatalogError {
     InvalidTag,
     #[error("storage error: {0}")]
     Storage(#[from] StorageError),
+    #[error("catalog state serialization failed: {0}")]
+    State(#[from] serde_json::Error),
 }
 
 #[derive(Clone, Default)]
@@ -27,13 +29,13 @@ pub struct Catalog {
     state: Arc<RwLock<CatalogState>>,
 }
 
-#[derive(Default)]
+#[derive(Default, serde::Serialize, serde::Deserialize)]
 struct CatalogState {
     repositories: BTreeMap<String, RepositoryRecord>,
     blob_created_at: BTreeMap<Digest, u64>,
 }
 
-#[derive(Clone)]
+#[derive(Clone, serde::Serialize, serde::Deserialize)]
 pub struct StoredManifest {
     pub digest: Digest,
     pub media_type: String,
@@ -43,7 +45,7 @@ pub struct StoredManifest {
     pub created_at: u64,
 }
 
-#[derive(Clone, Default)]
+#[derive(Clone, Default, serde::Serialize, serde::Deserialize)]
 struct RepositoryRecord {
     manifests: BTreeMap<Digest, StoredManifest>,
     tags: BTreeMap<String, Digest>,
@@ -60,6 +62,17 @@ pub struct GcReport {
 }
 
 impl Catalog {
+    pub fn from_snapshot(value: serde_json::Value) -> Result<Self, CatalogError> {
+        let state = serde_json::from_value(value)?;
+        Ok(Self {
+            state: Arc::new(RwLock::new(state)),
+        })
+    }
+
+    pub async fn snapshot(&self) -> Result<serde_json::Value, CatalogError> {
+        Ok(serde_json::to_value(&*self.state.read().await)?)
+    }
+
     pub async fn publish_manifest(
         &self,
         repository: &RepositoryName,
@@ -456,5 +469,24 @@ mod tests {
             store.get(&manifest_key(&orphan_record.digest)).await,
             Err(StorageError::NotFound)
         ));
+    }
+
+    #[tokio::test]
+    async fn snapshot_round_trip_preserves_manifest_and_tag_indexes() {
+        let catalog = Catalog::default();
+        let repository = RepositoryName::parse("team/app").expect("repository");
+        let manifest = image_manifest("");
+        let published = catalog
+            .publish_manifest(&repository, "latest", &manifest, None)
+            .await
+            .expect("publish");
+        let restored =
+            Catalog::from_snapshot(catalog.snapshot().await.expect("snapshot")).expect("restore");
+        let resolved = restored
+            .resolve_manifest(&repository, "latest")
+            .await
+            .expect("resolve");
+        assert_eq!(resolved.digest, published.digest);
+        assert_eq!(restored.manifest_count(&repository).await, 1);
     }
 }

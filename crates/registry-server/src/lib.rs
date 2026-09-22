@@ -7,7 +7,7 @@ mod state;
 mod uploads;
 
 pub use catalog::{Catalog, CatalogError, StoredManifest, blob_key, manifest_key};
-pub use config::{AppConfig, ConfigError, PullMode, StorageBackend};
+pub use config::{AppConfig, AppEnvironment, ConfigError, PullMode, StorageBackend};
 pub use error::AppError;
 pub use metrics::Metrics;
 pub use routes::router;

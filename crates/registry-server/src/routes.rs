@@ -28,6 +28,7 @@ use registry_events::{EventKind, RegistryEvent};
 use serde::Deserialize;
 use serde_json::json;
 use sha2::Sha256;
+use tower_http::services::{ServeDir, ServeFile};
 use tower_http::trace::TraceLayer;
 use uuid::Uuid;
 
@@ -35,8 +36,7 @@ use crate::{AppState, PullMode};
 use crate::{UploadError, blob_key, manifest_key};
 
 pub fn router(state: AppState) -> Router {
-    Router::new()
-        .route("/", get(index))
+    let router = Router::new()
         .route("/livez", get(livez))
         .route("/readyz", get(readyz))
         .route("/health/live", get(livez))
@@ -56,7 +56,15 @@ pub fn router(state: AppState) -> Router {
         .route("/api/v1/audit", get(list_audit))
         .route("/api/v1/webhooks", get(list_webhooks).post(create_webhook))
         .route("/api/v1/webhooks/{id}/disable", post(disable_webhook))
-        .route("/api/v1/admin/gc", post(run_gc))
+        .route("/api/v1/admin/gc", post(run_gc));
+    let router = if let Some(root) = state.config.static_root.clone() {
+        router.fallback_service(
+            ServeDir::new(&root).not_found_service(ServeFile::new(root.join("index.html"))),
+        )
+    } else {
+        router.route("/", get(index))
+    };
+    router
         .with_state(state.clone())
         .layer(middleware::from_fn_with_state(
             state.clone(),
@@ -64,10 +72,28 @@ pub fn router(state: AppState) -> Router {
         ))
         .layer(middleware::from_fn_with_state(
             state.clone(),
+            persistence_middleware,
+        ))
+        .layer(middleware::from_fn_with_state(
+            state.clone(),
             metrics_middleware,
         ))
         .layer(middleware::from_fn(request_id))
         .layer(TraceLayer::new_for_http())
+}
+
+async fn persistence_middleware(
+    State(state): State<AppState>,
+    request: Request<Body>,
+    next: Next,
+) -> Response {
+    let response = next.run(request).await;
+    if state.database.is_some()
+        && let Err(error) = state.persist_runtime_state().await
+    {
+        tracing::error!(error = %error, "runtime state persistence failed");
+    }
+    response
 }
 
 async fn metrics_middleware(
@@ -1508,10 +1534,11 @@ mod tests {
     use tower::util::ServiceExt;
 
     use super::*;
-    use crate::{AppConfig, AppState, StorageBackend};
+    use crate::{AppConfig, AppEnvironment, AppState, StorageBackend};
 
     fn test_config() -> AppConfig {
         AppConfig {
+            environment: AppEnvironment::Development,
             bind_addr: "127.0.0.1:0".parse().expect("addr"),
             public_url: "http://localhost:8080".to_owned(),
             database_url: None,
@@ -1519,6 +1546,7 @@ mod tests {
             require_database: false,
             storage_backend: StorageBackend::Memory,
             storage_root: std::env::temp_dir(),
+            static_root: None,
             request_body_limit_bytes: 1024,
             upload_chunk_limit_bytes: 1024 * 1024,
             token_issuer: "knotree-registry".to_owned(),

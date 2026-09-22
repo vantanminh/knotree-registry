@@ -81,13 +81,34 @@ pub struct WebhookRegistry {
     endpoints: Arc<RwLock<HashMap<Uuid, WebhookEndpoint>>>,
 }
 
-#[derive(Clone)]
+#[derive(Clone, Serialize, Deserialize)]
 struct WebhookEndpoint {
     summary: WebhookSummary,
     secret: String,
 }
 
 impl WebhookRegistry {
+    pub fn from_snapshot(value: serde_json::Value) -> Result<Self, serde_json::Error> {
+        let endpoints = serde_json::from_value::<Vec<WebhookEndpoint>>(value)?
+            .into_iter()
+            .map(|endpoint| (endpoint.summary.id, endpoint))
+            .collect();
+        Ok(Self {
+            endpoints: Arc::new(RwLock::new(endpoints)),
+        })
+    }
+
+    pub async fn snapshot(&self) -> Result<serde_json::Value, serde_json::Error> {
+        serde_json::to_value(
+            self.endpoints
+                .read()
+                .await
+                .values()
+                .cloned()
+                .collect::<Vec<_>>(),
+        )
+    }
+
     pub async fn create(
         &self,
         url: String,
@@ -143,6 +164,17 @@ impl WebhookRegistry {
 }
 
 impl EventLog {
+    pub fn from_snapshot(value: serde_json::Value) -> Result<Self, serde_json::Error> {
+        let events = serde_json::from_value(value)?;
+        Ok(Self {
+            events: Arc::new(RwLock::new(events)),
+        })
+    }
+
+    pub async fn snapshot(&self) -> Result<serde_json::Value, serde_json::Error> {
+        serde_json::to_value(&*self.events.read().await)
+    }
+
     pub async fn record(&self, event: RegistryEvent) {
         self.events.write().await.push(event);
     }

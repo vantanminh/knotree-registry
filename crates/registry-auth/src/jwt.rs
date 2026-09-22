@@ -26,6 +26,8 @@ pub(crate) enum JwtError {
     Time,
     #[error("bearer token algorithm or key id is invalid")]
     Header,
+    #[error("persistent signing key is invalid")]
+    Key,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -69,6 +71,13 @@ pub(crate) struct JwtIssuer {
     verifying_key: VerifyingKey,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub(crate) struct JwtSnapshot {
+    pub issuer: String,
+    pub kid: String,
+    pub private_key: Vec<u8>,
+}
+
 impl JwtIssuer {
     pub(crate) fn new(issuer: impl Into<String>) -> Self {
         let signing_key = SigningKey::random(&mut OsRng);
@@ -79,6 +88,29 @@ impl JwtIssuer {
             signing_key,
             verifying_key,
         }
+    }
+
+    pub(crate) fn snapshot(&self) -> JwtSnapshot {
+        JwtSnapshot {
+            issuer: self.issuer.clone(),
+            kid: self.kid.clone(),
+            private_key: self.signing_key.to_bytes().to_vec(),
+        }
+    }
+
+    pub(crate) fn from_snapshot(snapshot: JwtSnapshot) -> Result<Self, JwtError> {
+        if snapshot.private_key.len() != 32 {
+            return Err(JwtError::Key);
+        }
+        let signing_key =
+            SigningKey::from_slice(&snapshot.private_key).map_err(|_| JwtError::Key)?;
+        let verifying_key = *signing_key.verifying_key();
+        Ok(Self {
+            issuer: snapshot.issuer,
+            kid: snapshot.kid,
+            signing_key,
+            verifying_key,
+        })
     }
 
     pub(crate) fn issue(&self, claims: &RegistryClaims) -> Result<String, JwtError> {

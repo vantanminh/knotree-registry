@@ -9,7 +9,7 @@ pub const OCI_ARTIFACT_MANIFEST: &str = "application/vnd.oci.artifact.manifest.v
 pub const DOCKER_MANIFEST: &str = "application/vnd.docker.distribution.manifest.v2+json";
 pub const DOCKER_MANIFEST_LIST: &str = "application/vnd.docker.distribution.manifest.list.v2+json";
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct Descriptor {
     pub media_type: String,
     pub digest: Digest,

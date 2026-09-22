@@ -1,35 +1,65 @@
 services:
   postgres:
     image: postgres:17-alpine
+    restart: unless-stopped
     environment:
-      POSTGRES_DB: registry
-      POSTGRES_USER: registry
-      POSTGRES_PASSWORD: change-me-in-local-only
+      POSTGRES_DB: ${POSTGRES_DB:-registry}
+      POSTGRES_USER: ${POSTGRES_USER:-registry}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?Set POSTGRES_PASSWORD in the deployment environment}
     volumes:
       - postgres-data:/var/lib/postgresql/data
     healthcheck:
-      test: ["CMD-SHELL", "pg_isready -U registry -d registry"]
+      test: ["CMD-SHELL", "pg_isready -U $${POSTGRES_USER} -d $${POSTGRES_DB}"]
       interval: 5s
       timeout: 5s
-      retries: 10
+      retries: 12
 
   registry:
     build:
       context: ..
       dockerfile: deploy/registry.Dockerfile
-    env_file:
-      - ../.env
+    restart: unless-stopped
     environment:
+      APP_ENV: production
       BIND_ADDR: 0.0.0.0:8080
-      DATABASE_URL: postgres://registry:change-me-in-local-only@postgres:5432/registry
+      PUBLIC_REGISTRY_URL: ${PUBLIC_REGISTRY_URL:?Set PUBLIC_REGISTRY_URL, for example https://registry.knotree.org}
+      DATABASE_URL: ${DATABASE_URL:?Set DATABASE_URL with a URL-encoded password}
+      DATABASE_MAX_CONNECTIONS: ${DATABASE_MAX_CONNECTIONS:-10}
       REQUIRE_DATABASE: "true"
+      STORAGE_BACKEND: ${STORAGE_BACKEND:-local}
+      STORAGE_ROOT: /var/lib/knotree-registry/objects
+      STATIC_ROOT: /opt/knotree-registry/web
+      REQUEST_BODY_LIMIT_BYTES: ${REQUEST_BODY_LIMIT_BYTES:-4194304}
+      UPLOAD_CHUNK_LIMIT_BYTES: ${UPLOAD_CHUNK_LIMIT_BYTES:-67108864}
+      TOKEN_ISSUER: ${TOKEN_ISSUER:-knotree-registry}
+      TOKEN_SERVICE: ${TOKEN_SERVICE:-knotree-registry}
+      REGISTRY_TOKEN_TTL_SECONDS: ${REGISTRY_TOKEN_TTL_SECONDS:-300}
+      BOOTSTRAP_ADMIN_USERNAME: ${BOOTSTRAP_ADMIN_USERNAME:-admin}
+      BOOTSTRAP_ADMIN_PASSWORD: ${BOOTSTRAP_ADMIN_PASSWORD:?Set BOOTSTRAP_ADMIN_PASSWORD for the first startup}
+      COOKIE_SECURE: "true"
+      CONTROL_PLANE_ORIGINS: ${CONTROL_PLANE_ORIGINS:?Set CONTROL_PLANE_ORIGINS to the dashboard origin}
+      PULL_MODE: ${PULL_MODE:-proxy}
+      R2_ENDPOINT: ${R2_ENDPOINT:-}
+      R2_BUCKET: ${R2_BUCKET:-}
+      R2_ACCESS_KEY_ID: ${R2_ACCESS_KEY_ID:-}
+      R2_SECRET_ACCESS_KEY: ${R2_SECRET_ACCESS_KEY:-}
+      R2_REGION: ${R2_REGION:-auto}
+      EDGE_DOWNLOAD_URL: ${EDGE_DOWNLOAD_URL:-}
+      EDGE_DOWNLOAD_SECRET: ${EDGE_DOWNLOAD_SECRET:-}
     depends_on:
       postgres:
         condition: service_healthy
     ports:
-      - "8080:8080"
+      - "127.0.0.1:${REGISTRY_PORT:-8080}:8080"
     volumes:
       - registry-data:/var/lib/knotree-registry
+    read_only: true
+    tmpfs:
+      - /tmp:rw,noexec,nosuid,size=64m
+    cap_drop:
+      - ALL
+    security_opt:
+      - no-new-privileges:true
 
 volumes:
   postgres-data:

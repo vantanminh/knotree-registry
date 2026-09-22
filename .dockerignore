@@ -1,0 +1,12 @@
+.git
+.gitignore
+.env
+.env.*
+.5harness
+**/target/
+**/data/
+**/node_modules/
+**/dist/
+.5harness/
+docs
+*.log

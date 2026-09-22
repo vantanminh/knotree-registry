@@ -8,7 +8,7 @@ use argon2::{
     password_hash::{SaltString, rand_core::OsRng},
 };
 use registry_core::{Action, RepositoryName, RepositoryScope};
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use thiserror::Error;
 use uuid::Uuid;
 
@@ -45,6 +45,10 @@ pub enum AuthError {
     InvalidService,
     #[error("bearer token is invalid")]
     Bearer,
+    #[error("persistent authentication state is invalid")]
+    PersistentState,
+    #[error("persistent authentication state could not be serialized")]
+    PersistentStateSerialization,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -106,7 +110,7 @@ struct AuthState {
     login_attempts: HashMap<String, LoginAttempt>,
 }
 
-#[derive(Clone)]
+#[derive(Clone, Serialize, Deserialize)]
 struct UserRecord {
     id: Uuid,
     username: String,
@@ -114,7 +118,7 @@ struct UserRecord {
     is_admin: bool,
 }
 
-#[derive(Clone)]
+#[derive(Clone, Serialize, Deserialize)]
 struct CredentialRecord {
     id: Uuid,
     user_id: Uuid,
@@ -127,15 +131,33 @@ struct CredentialRecord {
     last_used_at: Option<u64>,
 }
 
+#[derive(Clone, Serialize, Deserialize)]
 struct SessionRecord {
     user_id: Uuid,
     expires_at: u64,
     revoked: bool,
 }
 
+#[derive(Clone, Serialize, Deserialize)]
 struct LoginAttempt {
     failures: u32,
     blocked_until: u64,
+}
+
+#[derive(Serialize, Deserialize)]
+struct AuthSnapshot {
+    version: u32,
+    issuer: crate::jwt::JwtSnapshot,
+    users: Vec<UserRecord>,
+    credentials: Vec<CredentialRecord>,
+    sessions: Vec<SessionSnapshot>,
+    login_attempts: HashMap<String, LoginAttempt>,
+}
+
+#[derive(Serialize, Deserialize)]
+struct SessionSnapshot {
+    digest: Vec<u8>,
+    record: SessionRecord,
 }
 
 impl AuthService {
@@ -158,6 +180,87 @@ impl AuthService {
             service: service.into(),
             token_ttl: Duration::from_secs(token_ttl_seconds.clamp(60, 3600)),
         }
+    }
+
+    pub fn from_snapshot(
+        issuer: impl Into<String>,
+        service: impl Into<String>,
+        token_ttl_seconds: u64,
+        value: serde_json::Value,
+    ) -> Result<Self, AuthError> {
+        let issuer_name = issuer.into();
+        let snapshot: AuthSnapshot =
+            serde_json::from_value(value).map_err(|_| AuthError::PersistentState)?;
+        if snapshot.version != 1 || snapshot.issuer.issuer != issuer_name {
+            return Err(AuthError::PersistentState);
+        }
+        let issuer =
+            JwtIssuer::from_snapshot(snapshot.issuer).map_err(|_| AuthError::PersistentState)?;
+        let mut users = HashMap::with_capacity(snapshot.users.len());
+        for user in snapshot.users {
+            if users.insert(user.username.clone(), user).is_some() {
+                return Err(AuthError::PersistentState);
+            }
+        }
+        let mut credentials = HashMap::with_capacity(snapshot.credentials.len());
+        let mut credential_prefixes = HashMap::with_capacity(snapshot.credentials.len());
+        for credential in snapshot.credentials {
+            if !users.values().any(|user| user.id == credential.user_id)
+                || credential_prefixes
+                    .insert(credential.prefix.clone(), credential.id)
+                    .is_some()
+                || credentials.insert(credential.id, credential).is_some()
+            {
+                return Err(AuthError::PersistentState);
+            }
+        }
+        let mut sessions = HashMap::with_capacity(snapshot.sessions.len());
+        for session in snapshot.sessions {
+            let digest: [u8; 32] = session
+                .digest
+                .try_into()
+                .map_err(|_| AuthError::PersistentState)?;
+            if sessions.insert(digest, session.record).is_some() {
+                return Err(AuthError::PersistentState);
+            }
+        }
+        Ok(Self {
+            state: std::sync::Arc::new(tokio::sync::RwLock::new(AuthState {
+                users,
+                credentials,
+                credential_prefixes,
+                sessions,
+                login_attempts: snapshot.login_attempts,
+            })),
+            issuer,
+            issuer_name,
+            service: service.into(),
+            token_ttl: Duration::from_secs(token_ttl_seconds.clamp(60, 3600)),
+        })
+    }
+
+    pub async fn has_users(&self) -> bool {
+        !self.state.read().await.users.is_empty()
+    }
+
+    pub async fn snapshot(&self) -> Result<serde_json::Value, AuthError> {
+        let state = self.state.read().await;
+        let snapshot = AuthSnapshot {
+            version: 1,
+            issuer: self.issuer.snapshot(),
+            users: state.users.values().cloned().collect(),
+            credentials: state.credentials.values().cloned().collect(),
+            sessions: state
+                .sessions
+                .iter()
+                .map(|(digest, record)| SessionSnapshot {
+                    digest: digest.to_vec(),
+                    record: record.clone(),
+                })
+                .collect(),
+            login_attempts: state.login_attempts.clone(),
+        };
+        serde_json::to_value(snapshot).map_err(|_| AuthError::PersistentStateSerialization)
     }
 
     pub async fn bootstrap_admin(
@@ -693,5 +796,55 @@ mod tests {
         let attempt = state.login_attempts.get("admin").expect("login attempt");
         assert_eq!(attempt.failures, 5);
         assert!(attempt.blocked_until > now_seconds());
+    }
+
+    #[tokio::test]
+    async fn snapshot_round_trip_preserves_credentials_and_signing_key() {
+        let auth = AuthService::new("knotree-registry", "knotree-registry", 300);
+        auth.bootstrap_admin("admin", "correct horse battery staple")
+            .await
+            .expect("bootstrap");
+        let session = auth
+            .login("admin", "correct horse battery staple")
+            .await
+            .expect("login");
+        let credential = auth
+            .create_credential_for_session(
+                &session.token,
+                "ci".to_owned(),
+                vec![scope("repository:team/app:pull,push")],
+                None,
+            )
+            .await
+            .expect("credential");
+        let restored = AuthService::from_snapshot(
+            "knotree-registry",
+            "knotree-registry",
+            300,
+            auth.snapshot().await.expect("snapshot"),
+        )
+        .expect("restore");
+        let minted = restored
+            .mint_token(
+                "admin",
+                &credential.secret,
+                "knotree-registry",
+                &[scope("repository:team/app:pull")],
+            )
+            .await
+            .expect("mint after restore");
+        assert_eq!(minted.expires_in, 300);
+        assert_eq!(
+            restored
+                .verify_bearer(
+                    &minted.token,
+                    &RepositoryName::parse("team/app").expect("repository"),
+                    Action::Pull,
+                )
+                .await
+                .expect("verify after restore")
+                .username,
+            "admin"
+        );
     }
 }

@@ -1,6 +1,6 @@
 # Knotree Registry
 
-Knotree Registry is a private OCI/Docker registry under active implementation. The backend is a Rust workspace with a protocol-independent core, a storage boundary, PostgreSQL migrations and an Axum service. Cloudflare R2 is the target production object store; the foundation slice also provides deterministic memory and local-file stores for development and tests.
+Knotree Registry is a private OCI/Docker registry. The backend is a Rust workspace with a protocol-independent core, a storage boundary, PostgreSQL migrations and an Axum service. Runtime metadata, credentials, catalog indexes, upload sessions, events and webhook registrations are restored from PostgreSQL on restart. Cloudflare R2 is the recommended production object store; local storage remains available for a single-machine deployment.
 
 ## Development
 
@@ -27,6 +27,20 @@ curl http://127.0.0.1:8080/livez
 curl http://127.0.0.1:8080/readyz
 curl http://127.0.0.1:8080/v2/
 ```
+
+## Production deployment
+
+The production image builds the React dashboard and serves it from the same Axum process, so the Cloudflare Tunnel should target `http://127.0.0.1:8080`. Copy `deploy/.env.example` to a secret-managed environment file, replace every placeholder, and start the stack:
+
+```powershell
+docker compose --env-file deploy/.env -f deploy/docker-compose.yml up -d --build
+docker compose --env-file deploy/.env -f deploy/docker-compose.yml ps
+Invoke-RestMethod http://127.0.0.1:8080/readyz
+```
+
+The first startup creates the configured bootstrap administrator. Keep that password in the secret manager; after the first login, create a narrowly scoped PAT in the dashboard for Docker/CI and do not use the browser password with `docker login`. The compose profile binds the registry only to localhost, uses PostgreSQL for durable state, serves the frontend from the image, and runs as a non-root read-only container with a writable data volume.
+
+The current runtime snapshot model is deliberately single-instance: do not run multiple registry containers against the same database until the normalized PostgreSQL repositories are enabled. Use R2 and the documented backup procedure before treating the machine as disposable.
 
 ## Architecture
 

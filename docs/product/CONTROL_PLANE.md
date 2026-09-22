@@ -10,7 +10,7 @@ npm install
 npm run dev
 ```
 
-The Vite development server proxies `/api`, `/auth`, and `/v2` to `http://127.0.0.1:8080`. The production bundle is generated with `npm run build`; serve `web/dist` from the same origin as the registry API or configure an equivalent reverse-proxy path.
+The Vite development server proxies `/api`, `/auth`, and `/v2` to `http://127.0.0.1:8080`. The production image runs `npm run build` during the container build and the Rust service serves `STATIC_ROOT` from the same origin as the registry API. Keep Vite only in the local development workflow.
 
 ## Endpoints
 

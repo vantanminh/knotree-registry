@@ -20,6 +20,8 @@ pub enum AppError {
     Catalog(#[from] crate::CatalogError),
     #[error("bad request: {0}")]
     BadRequest(&'static str),
+    #[error("persistent runtime state error: {0}")]
+    State(String),
 }
 
 impl IntoResponse for AppError {

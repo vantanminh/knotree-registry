@@ -2,11 +2,13 @@
 
 ## Production shape
 
-Run PostgreSQL, `registry-server`, a same-origin static host for `web/dist`, and a private Cloudflare R2 bucket. Put TLS and request-size limits at the reverse proxy as well as in the application. Keep `STORAGE_BACKEND=r2`, `R2_REGION=auto`, and never grant public bucket access. The optional edge Worker uses a separate `blobs.example.com` host and only receives short-lived digest-bound grants.
+The checked-in production compose profile runs PostgreSQL and a single `registry-server` container. The image builds and serves `web/dist` itself, so the Cloudflare Tunnel should target `http://127.0.0.1:8080`; no Vite development server belongs in the production path. Put TLS and request-size limits at the edge as well as in the application. Use `STORAGE_BACKEND=r2` with a private bucket when the host must be replaceable; local storage is supported only when the registry volume is backed up and the deployment stays single-host. The optional edge Worker uses a separate blob host and only receives short-lived digest-bound grants.
+
+The service fails fast in `APP_ENV=production` unless the public URL is HTTPS, PostgreSQL is required, cookies are secure, memory storage is disabled, and `STATIC_ROOT/index.html` exists. The first boot needs `BOOTSTRAP_ADMIN_USERNAME` and `BOOTSTRAP_ADMIN_PASSWORD`; later restarts restore the existing user and ignore the bootstrap pair.
 
 ## Backups and restore
 
-PostgreSQL metadata is required for authorization, tags, uploads, and garbage-collection reachability. Take a daily compressed dump and verify it in a disposable database:
+PostgreSQL stores the runtime snapshot used to restore authorization, tags, local upload sessions, events, webhook registrations and garbage-collection reachability. R2 multipart upload internals are not resumed across a process restart; clients should retry an interrupted upload and the bucket should have a lifecycle rule for abandoned multipart uploads. Take a daily compressed dump and verify it in a disposable database:
 
 ```powershell
 pg_dump --format=custom --file=registry-$(Get-Date -Format yyyyMMdd).dump $env:DATABASE_URL
@@ -38,7 +40,7 @@ Inspect failures before running the same request with `dry_run:false`. Never byp
 
 ## Signing keys and token revocation
 
-Registry access JWT signing keys are process-local today and rotate when the service restarts; the short default TTL bounds already-issued tokens. For a multi-instance production rollout, persist active and retired keys in `registry_signing_keys`, publish a stable `kid`, overlap old and new verification keys for at least the token TTL, and retire the old key only after that overlap. Revoking a PAT immediately prevents new token minting; existing bearer tokens expire at the configured TTL.
+The active ES256 signing key and `kid` are included in the PostgreSQL runtime snapshot, so a normal restart does not invalidate browser sessions or short-lived registry tokens. The current snapshot is single-instance and last-write-wins; do not scale the registry horizontally. A future multi-instance rollout must replace the snapshot with transactional repositories and a key-ring backed by `registry_signing_keys` before adding replicas. Revoking a PAT immediately prevents new token minting; existing bearer tokens expire at the configured TTL.
 
 ## Incident response
 

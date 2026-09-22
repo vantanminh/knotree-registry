@@ -7,6 +7,7 @@ use std::{
 use bytes::Bytes;
 use registry_core::{Digest, RepositoryName};
 use registry_storage::{DynObjectStore, StorageError};
+use serde::{Deserialize, Serialize};
 use thiserror::Error;
 use tokio::sync::{Mutex, RwLock};
 use uuid::Uuid;
@@ -41,13 +42,14 @@ struct UploadEntry {
     state: Mutex<UploadState>,
 }
 
+#[derive(Clone, Serialize, Deserialize)]
 struct UploadState {
     offset: u64,
     expires_at: u64,
     status: UploadStatusKind,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum UploadStatusKind {
     Active,
     Completed,
@@ -73,12 +75,69 @@ pub struct FinalizedUpload {
     pub size: u64,
 }
 
+#[derive(Serialize, Deserialize)]
+struct UploadSnapshot {
+    version: u32,
+    sessions: Vec<UploadSnapshotEntry>,
+}
+
+#[derive(Serialize, Deserialize)]
+struct UploadSnapshotEntry {
+    id: Uuid,
+    repository: RepositoryName,
+    staging_key: String,
+    state: UploadState,
+}
+
 impl UploadManager {
     pub fn new(ttl: Duration) -> Self {
         Self {
             sessions: Arc::new(RwLock::new(HashMap::new())),
             ttl,
         }
+    }
+
+    pub fn from_snapshot(
+        ttl: Duration,
+        value: serde_json::Value,
+        resume_active: bool,
+    ) -> Result<Self, serde_json::Error> {
+        let snapshot: UploadSnapshot = serde_json::from_value(value)?;
+        let mut sessions = HashMap::with_capacity(snapshot.sessions.len());
+        for entry in snapshot.sessions {
+            if !resume_active && entry.state.status == UploadStatusKind::Active {
+                continue;
+            }
+            sessions.insert(
+                entry.id,
+                Arc::new(UploadEntry {
+                    repository: entry.repository,
+                    staging_key: entry.staging_key,
+                    state: Mutex::new(entry.state),
+                }),
+            );
+        }
+        Ok(Self {
+            sessions: Arc::new(RwLock::new(sessions)),
+            ttl,
+        })
+    }
+
+    pub async fn snapshot(&self) -> Result<serde_json::Value, serde_json::Error> {
+        let entries = self.sessions.read().await;
+        let mut sessions = Vec::with_capacity(entries.len());
+        for (id, entry) in entries.iter() {
+            sessions.push(UploadSnapshotEntry {
+                id: *id,
+                repository: entry.repository.clone(),
+                staging_key: entry.staging_key.clone(),
+                state: entry.state.lock().await.clone(),
+            });
+        }
+        serde_json::to_value(UploadSnapshot {
+            version: 1,
+            sessions,
+        })
     }
 
     pub async fn create(&self, repository: RepositoryName) -> UploadStatus {

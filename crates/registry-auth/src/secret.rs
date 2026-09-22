@@ -3,7 +3,7 @@ use rand_core::{OsRng, RngCore};
 use sha2::{Digest as _, Sha256};
 use subtle::ConstantTimeEq;
 
-#[derive(Clone)]
+#[derive(Clone, serde::Serialize, serde::Deserialize)]
 pub(crate) struct SecretVerifier {
     salt: [u8; 16],
     digest: [u8; 32],

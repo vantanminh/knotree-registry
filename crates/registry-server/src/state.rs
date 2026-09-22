@@ -7,8 +7,22 @@ use registry_auth::AuthService;
 use registry_db::Database;
 use registry_events::{EventLog, WebhookRegistry};
 use registry_storage::{DynObjectStore, LocalFileStore, MemoryObjectStore, R2ObjectStore};
+use serde::{Deserialize, Serialize};
+use serde_json::Value;
 
 use crate::{AppConfig, AppError, Catalog, Metrics, StorageBackend, UploadManager};
+
+const RUNTIME_SNAPSHOT_KEY: &str = "registry-server";
+
+#[derive(Debug, Serialize, Deserialize)]
+struct RuntimeSnapshot {
+    version: u32,
+    auth: Value,
+    catalog: Value,
+    uploads: Value,
+    events: Value,
+    webhooks: Value,
+}
 
 #[derive(Clone)]
 pub struct AppState {
@@ -67,33 +81,123 @@ impl AppState {
             }
             None => None,
         };
-        let auth = Arc::new(AuthService::new(
-            config.token_issuer.clone(),
-            config.token_service.clone(),
-            config.token_ttl_seconds,
-        ));
-        if let (Some(username), Some(password)) = (
-            config.bootstrap_admin_username.as_deref(),
-            config.bootstrap_admin_password.as_deref(),
-        ) {
-            auth.bootstrap_admin(username, password)
-                .await
-                .map_err(AppError::Auth)?;
+        let persisted = match &database {
+            Some(database) => database
+                .load_snapshot(RUNTIME_SNAPSHOT_KEY)
+                .await?
+                .map(|value| {
+                    serde_json::from_value::<RuntimeSnapshot>(value)
+                        .map_err(|error| AppError::State(error.to_string()))
+                })
+                .transpose()?,
+            None => None,
+        };
+        if persisted
+            .as_ref()
+            .is_some_and(|snapshot| snapshot.version != 1)
+        {
+            return Err(AppError::State(
+                "unsupported runtime snapshot version".to_owned(),
+            ));
         }
-        let catalog = Arc::new(Catalog::default());
-        let uploads = Arc::new(UploadManager::new(Duration::from_secs(24 * 60 * 60)));
-        Ok(Self {
+        let auth = Arc::new(match persisted.as_ref() {
+            Some(snapshot) => AuthService::from_snapshot(
+                config.token_issuer.clone(),
+                config.token_service.clone(),
+                config.token_ttl_seconds,
+                snapshot.auth.clone(),
+            )
+            .map_err(AppError::Auth)?,
+            None => AuthService::new(
+                config.token_issuer.clone(),
+                config.token_service.clone(),
+                config.token_ttl_seconds,
+            ),
+        });
+        if !auth.has_users().await {
+            if let (Some(username), Some(password)) = (
+                config.bootstrap_admin_username.as_deref(),
+                config.bootstrap_admin_password.as_deref(),
+            ) {
+                auth.bootstrap_admin(username, password)
+                    .await
+                    .map_err(AppError::Auth)?;
+            } else if config.environment == crate::AppEnvironment::Production {
+                return Err(crate::ConfigError::BootstrapAdminRequired.into());
+            }
+        }
+        let catalog = Arc::new(match persisted.as_ref() {
+            Some(snapshot) => {
+                Catalog::from_snapshot(snapshot.catalog.clone()).map_err(AppError::Catalog)?
+            }
+            None => Catalog::default(),
+        });
+        let upload_ttl = Duration::from_secs(24 * 60 * 60);
+        let uploads = Arc::new(match persisted.as_ref() {
+            Some(snapshot) => UploadManager::from_snapshot(
+                upload_ttl,
+                snapshot.uploads.clone(),
+                config.storage_backend == StorageBackend::Local,
+            )
+            .map_err(|error| AppError::State(error.to_string()))?,
+            None => UploadManager::new(upload_ttl),
+        });
+        let events = match persisted.as_ref() {
+            Some(snapshot) => EventLog::from_snapshot(snapshot.events.clone())
+                .map_err(|error| AppError::State(error.to_string()))?,
+            None => EventLog::default(),
+        };
+        let webhooks = match persisted.as_ref() {
+            Some(snapshot) => WebhookRegistry::from_snapshot(snapshot.webhooks.clone())
+                .map_err(|error| AppError::State(error.to_string()))?,
+            None => WebhookRegistry::default(),
+        };
+        let state = Self {
             config: Arc::new(config),
             store,
             database,
             auth,
             catalog,
             uploads,
-            events: EventLog::default(),
-            webhooks: WebhookRegistry::default(),
+            events,
+            webhooks,
             metrics: Metrics::default(),
             started_at: Instant::now(),
-        })
+        };
+        state.persist_runtime_state().await?;
+        Ok(state)
+    }
+
+    pub async fn persist_runtime_state(&self) -> Result<(), AppError> {
+        let Some(database) = &self.database else {
+            return Ok(());
+        };
+        let snapshot = RuntimeSnapshot {
+            version: 1,
+            auth: self.auth.snapshot().await.map_err(AppError::Auth)?,
+            catalog: self.catalog.snapshot().await.map_err(AppError::Catalog)?,
+            uploads: self
+                .uploads
+                .snapshot()
+                .await
+                .map_err(|error| AppError::State(error.to_string()))?,
+            events: self
+                .events
+                .snapshot()
+                .await
+                .map_err(|error| AppError::State(error.to_string()))?,
+            webhooks: self
+                .webhooks
+                .snapshot()
+                .await
+                .map_err(|error| AppError::State(error.to_string()))?,
+        };
+        let value =
+            serde_json::to_value(snapshot).map_err(|error| AppError::State(error.to_string()))?;
+        database
+            .save_snapshot(RUNTIME_SNAPSHOT_KEY, &value)
+            .await
+            .map_err(AppError::Database)
     }
 
     pub async fn readiness(&self) -> Readiness {

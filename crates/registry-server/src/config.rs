@@ -10,6 +10,13 @@ pub enum StorageBackend {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AppEnvironment {
+    Development,
+    Staging,
+    Production,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum PullMode {
     Proxy,
     Edge,
@@ -17,6 +24,7 @@ pub enum PullMode {
 
 #[derive(Debug, Clone)]
 pub struct AppConfig {
+    pub environment: AppEnvironment,
     pub bind_addr: SocketAddr,
     pub public_url: String,
     pub database_url: Option<String>,
@@ -24,6 +32,7 @@ pub struct AppConfig {
     pub require_database: bool,
     pub storage_backend: StorageBackend,
     pub storage_root: PathBuf,
+    pub static_root: Option<PathBuf>,
     pub request_body_limit_bytes: usize,
     pub upload_chunk_limit_bytes: usize,
     pub token_issuer: String,
@@ -65,10 +74,34 @@ pub enum ConfigError {
     EdgeUnavailable,
     #[error("BOOTSTRAP_ADMIN_USERNAME and BOOTSTRAP_ADMIN_PASSWORD must be set together")]
     BootstrapCredentialsIncomplete,
+    #[error("invalid APP_ENV '{0}', expected development, staging, or production")]
+    Environment(String),
+    #[error("production requires PUBLIC_REGISTRY_URL to use https")]
+    ProductionPublicUrl,
+    #[error("production requires REQUIRE_DATABASE=true and DATABASE_URL")]
+    ProductionDatabase,
+    #[error("production requires COOKIE_SECURE=true")]
+    ProductionCookie,
+    #[error("production cannot use STORAGE_BACKEND=memory")]
+    ProductionStorage,
+    #[error("production requires STATIC_ROOT to contain the built frontend")]
+    ProductionStaticRoot,
+    #[error("production requires bootstrap admin credentials on first startup")]
+    BootstrapAdminRequired,
 }
 
 impl AppConfig {
     pub fn from_env() -> Result<Self, ConfigError> {
+        let environment = match env::var("APP_ENV")
+            .unwrap_or_else(|_| "development".to_owned())
+            .to_ascii_lowercase()
+            .as_str()
+        {
+            "development" | "dev" => AppEnvironment::Development,
+            "staging" | "stage" => AppEnvironment::Staging,
+            "production" | "prod" => AppEnvironment::Production,
+            value => return Err(ConfigError::Environment(value.to_owned())),
+        };
         let bind_addr = env::var("BIND_ADDR")
             .unwrap_or_else(|_| "127.0.0.1:8080".to_owned())
             .parse()?;
@@ -91,6 +124,10 @@ impl AppConfig {
         };
         let storage_root =
             PathBuf::from(env::var("STORAGE_ROOT").unwrap_or_else(|_| "./data/objects".to_owned()));
+        let static_root = env::var("STATIC_ROOT")
+            .ok()
+            .filter(|value| !value.trim().is_empty())
+            .map(PathBuf::from);
         let request_body_limit_bytes = parse_usize("REQUEST_BODY_LIMIT_BYTES", 4 * 1024 * 1024)?;
         let upload_chunk_limit_bytes = parse_usize("UPLOAD_CHUNK_LIMIT_BYTES", 64 * 1024 * 1024)?;
         let token_issuer =
@@ -141,6 +178,7 @@ impl AppConfig {
             .map(str::to_owned)
             .collect();
         let config = Self {
+            environment,
             bind_addr,
             public_url,
             database_url,
@@ -148,6 +186,7 @@ impl AppConfig {
             require_database,
             storage_backend,
             storage_root,
+            static_root,
             request_body_limit_bytes,
             upload_chunk_limit_bytes,
             token_issuer,
@@ -171,7 +210,10 @@ impl AppConfig {
     }
 
     pub fn validate(&self) -> Result<(), ConfigError> {
-        if !(self.public_url.starts_with("http://") || self.public_url.starts_with("https://")) {
+        let Ok(public_url) = url::Url::parse(&self.public_url) else {
+            return Err(ConfigError::PublicUrl);
+        };
+        if !matches!(public_url.scheme(), "http" | "https") || public_url.host_str().is_none() {
             return Err(ConfigError::PublicUrl);
         }
         if self.require_database && self.database_url.is_none() {
@@ -198,6 +240,45 @@ impl AppConfig {
         }
         if self.bootstrap_admin_username.is_some() != self.bootstrap_admin_password.is_some() {
             return Err(ConfigError::BootstrapCredentialsIncomplete);
+        }
+        if self.database_max_connections == 0 {
+            return Err(ConfigError::Number(
+                "DATABASE_MAX_CONNECTIONS",
+                self.database_max_connections.to_string(),
+            ));
+        }
+        if self.request_body_limit_bytes == 0 {
+            return Err(ConfigError::Number(
+                "REQUEST_BODY_LIMIT_BYTES",
+                self.request_body_limit_bytes.to_string(),
+            ));
+        }
+        if self.upload_chunk_limit_bytes == 0 {
+            return Err(ConfigError::Number(
+                "UPLOAD_CHUNK_LIMIT_BYTES",
+                self.upload_chunk_limit_bytes.to_string(),
+            ));
+        }
+        if self.environment == AppEnvironment::Production {
+            if public_url.scheme() != "https" {
+                return Err(ConfigError::ProductionPublicUrl);
+            }
+            if !self.require_database || self.database_url.is_none() {
+                return Err(ConfigError::ProductionDatabase);
+            }
+            if !self.cookie_secure {
+                return Err(ConfigError::ProductionCookie);
+            }
+            if self.storage_backend == StorageBackend::Memory {
+                return Err(ConfigError::ProductionStorage);
+            }
+            if self
+                .static_root
+                .as_ref()
+                .is_none_or(|path| !path.join("index.html").is_file())
+            {
+                return Err(ConfigError::ProductionStaticRoot);
+            }
         }
         Ok(())
     }
@@ -229,4 +310,64 @@ fn parse_bool(name: &'static str, default: bool) -> Result<bool, ConfigError> {
             _ => Err(ConfigError::Number(name, value)),
         }
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn config() -> AppConfig {
+        AppConfig {
+            environment: AppEnvironment::Development,
+            bind_addr: "127.0.0.1:8080".parse().expect("address"),
+            public_url: "http://localhost:8080".to_owned(),
+            database_url: None,
+            database_max_connections: 10,
+            require_database: false,
+            storage_backend: StorageBackend::Memory,
+            storage_root: PathBuf::from("./data/objects"),
+            static_root: None,
+            request_body_limit_bytes: 4 * 1024 * 1024,
+            upload_chunk_limit_bytes: 64 * 1024 * 1024,
+            token_issuer: "knotree-registry".to_owned(),
+            token_service: "knotree-registry".to_owned(),
+            token_ttl_seconds: 300,
+            bootstrap_admin_username: None,
+            bootstrap_admin_password: None,
+            cookie_secure: true,
+            r2_endpoint: None,
+            r2_bucket: None,
+            r2_access_key_id: None,
+            r2_secret_access_key: None,
+            r2_region: "auto".to_owned(),
+            pull_mode: PullMode::Proxy,
+            edge_download_url: None,
+            edge_download_secret: None,
+            control_plane_origins: Vec::new(),
+        }
+    }
+
+    #[test]
+    fn production_rejects_insecure_public_url_before_startup() {
+        let mut config = config();
+        config.environment = AppEnvironment::Production;
+        assert!(matches!(
+            config.validate(),
+            Err(ConfigError::ProductionPublicUrl)
+        ));
+    }
+
+    #[test]
+    fn production_rejects_memory_storage() {
+        let mut config = config();
+        config.environment = AppEnvironment::Production;
+        config.public_url = "https://registry.example.com".to_owned();
+        config.database_url = Some("postgres://registry:secret@db/registry".to_owned());
+        config.require_database = true;
+        config.static_root = Some(PathBuf::from("."));
+        assert!(matches!(
+            config.validate(),
+            Err(ConfigError::ProductionStorage)
+        ));
+    }
 }
