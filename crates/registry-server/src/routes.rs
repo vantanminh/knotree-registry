@@ -6,7 +6,7 @@ use std::{
 use axum::{
     Json, Router,
     body::Body,
-    extract::{Path, Query, State},
+    extract::{Path, Query, RawQuery, State},
     http::{
         HeaderMap, HeaderName, HeaderValue, Method, Request, StatusCode,
         header::{
@@ -1116,25 +1116,26 @@ fn bearer_token(headers: &HeaderMap) -> Option<&str> {
         .strip_prefix("Bearer ")
 }
 
-#[derive(Debug, Deserialize)]
-struct TokenQuery {
-    service: Option<String>,
-    scope: Option<String>,
-}
-
 async fn token(
     State(state): State<AppState>,
-    Query(query): Query<TokenQuery>,
+    RawQuery(raw_query): RawQuery,
     headers: HeaderMap,
 ) -> Result<impl IntoResponse, crate::AppError> {
-    let service = query
-        .service
+    let mut service = None;
+    let mut scopes = Vec::new();
+    for (key, value) in url::form_urlencoded::parse(raw_query.unwrap_or_default().as_bytes()) {
+        match key.as_ref() {
+            "service" => service = Some(value.into_owned()),
+            "scope" => scopes.push(value.into_owned()),
+            _ => {}
+        }
+    }
+    let service = service
         .as_deref()
         .ok_or(crate::AppError::BadRequest("service is required"))?;
     let (username, password) =
         basic_credentials(&headers).ok_or(registry_auth::AuthError::InvalidCredentials)?;
-    let requested = query
-        .scope
+    let requested = scopes
         .iter()
         .flat_map(|value| value.split_whitespace())
         .map(parse_scope)
@@ -1563,6 +1564,43 @@ mod tests {
             .expect("response");
         assert_eq!(response.status(), StatusCode::OK);
         assert!(response.headers().contains_key("x-request-id"));
+    }
+
+    #[tokio::test]
+    async fn token_endpoint_accepts_repeated_scope_parameters() {
+        let state = AppState::initialize(test_config()).await.expect("state");
+        let user = state
+            .auth
+            .bootstrap_admin("admin", "correct horse battery staple")
+            .await
+            .expect("bootstrap");
+        let credential = state
+            .auth
+            .issue_credential_for_user(
+                user.id,
+                "docker".to_owned(),
+                vec![parse_scope("repository:team/app:pull,push").expect("scope")],
+                None,
+            )
+            .await
+            .expect("credential");
+        let basic = base64::engine::general_purpose::STANDARD
+            .encode(format!("admin:{}", credential.secret));
+        let response = router(state)
+            .oneshot(
+                Request::builder()
+                    .uri("/auth/token?service=knotree-registry&scope=repository%3Ateam%2Fapp%3Apull&scope=repository%3Ateam%2Fapp%3Apull%2Cpush")
+                    .header("authorization", format!("Basic {basic}"))
+                    .body(Body::empty())
+                    .expect("request"),
+            )
+            .await
+            .expect("response");
+        let status = response.status();
+        let body = to_bytes(response.into_body(), usize::MAX)
+            .await
+            .expect("body");
+        assert_eq!(status, StatusCode::OK, "{}", String::from_utf8_lossy(&body));
     }
 
     #[tokio::test]
