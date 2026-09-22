@@ -1,0 +1,36 @@
+services:
+  postgres:
+    image: postgres:17-alpine
+    environment:
+      POSTGRES_DB: registry
+      POSTGRES_USER: registry
+      POSTGRES_PASSWORD: change-me-in-local-only
+    volumes:
+      - postgres-data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U registry -d registry"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+
+  registry:
+    build:
+      context: ..
+      dockerfile: deploy/registry.Dockerfile
+    env_file:
+      - ../.env
+    environment:
+      BIND_ADDR: 0.0.0.0:8080
+      DATABASE_URL: postgres://registry:change-me-in-local-only@postgres:5432/registry
+      REQUIRE_DATABASE: "true"
+    depends_on:
+      postgres:
+        condition: service_healthy
+    ports:
+      - "8080:8080"
+    volumes:
+      - registry-data:/var/lib/knotree-registry
+
+volumes:
+  postgres-data:
+  registry-data:
