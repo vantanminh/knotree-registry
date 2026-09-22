@@ -15,6 +15,7 @@ services:
       retries: 12
 
   registry:
+    image: ${REGISTRY_IMAGE:-knotree-registry:prod}
     build:
       context: ..
       dockerfile: deploy/registry.Dockerfile
