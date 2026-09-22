@@ -9,7 +9,11 @@ export default defineConfig({
     proxy: {
       "/api": "http://127.0.0.1:8080",
       "/auth": "http://127.0.0.1:8080",
-      "/v2": "http://127.0.0.1:8080"
+      "/v2": "http://127.0.0.1:8080",
+      "/livez": "http://127.0.0.1:8080",
+      "/readyz": "http://127.0.0.1:8080",
+      "/health": "http://127.0.0.1:8080",
+      "/metrics": "http://127.0.0.1:8080"
     }
   }
 });
