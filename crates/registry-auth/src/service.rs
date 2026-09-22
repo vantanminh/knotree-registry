@@ -103,6 +103,7 @@ struct AuthState {
     credentials: HashMap<Uuid, CredentialRecord>,
     credential_prefixes: HashMap<String, Uuid>,
     sessions: HashMap<[u8; 32], SessionRecord>,
+    login_attempts: HashMap<String, LoginAttempt>,
 }
 
 #[derive(Clone)]
@@ -132,6 +133,11 @@ struct SessionRecord {
     revoked: bool,
 }
 
+struct LoginAttempt {
+    failures: u32,
+    blocked_until: u64,
+}
+
 impl AuthService {
     pub fn new(
         issuer: impl Into<String>,
@@ -145,6 +151,7 @@ impl AuthService {
                 credentials: HashMap::new(),
                 credential_prefixes: HashMap::new(),
                 sessions: HashMap::new(),
+                login_attempts: HashMap::new(),
             })),
             issuer: JwtIssuer::new(&issuer_name),
             issuer_name,
@@ -176,12 +183,25 @@ impl AuthService {
     }
 
     pub async fn login(&self, username: &str, password: &str) -> Result<Session, AuthError> {
+        let now = now_seconds();
         let user = {
             let state = self.state.read().await;
+            if state
+                .login_attempts
+                .get(username)
+                .is_some_and(|attempt| attempt.blocked_until > now)
+            {
+                return Err(AuthError::InvalidCredentials);
+            }
             state.users.get(username).cloned()
+        };
+        let Some(user) = user else {
+            return Err(self.failed_login(username).await);
+        };
+        if verify_password(&user.password_hash, password).is_err() {
+            return Err(self.failed_login(username).await);
         }
-        .ok_or(AuthError::InvalidCredentials)?;
-        verify_password(&user.password_hash, password)?;
+        self.state.write().await.login_attempts.remove(username);
         let (token, _, _) = issue_secret("kntr_session_");
         let expires_at = now_seconds().saturating_add(8 * 60 * 60);
         self.state.write().await.sessions.insert(
@@ -464,6 +484,24 @@ impl AuthService {
         }
         Ok(session.user_id)
     }
+
+    async fn failed_login(&self, username: &str) -> AuthError {
+        let now = now_seconds();
+        let mut state = self.state.write().await;
+        let attempt = state
+            .login_attempts
+            .entry(username.to_owned())
+            .or_insert(LoginAttempt {
+                failures: 0,
+                blocked_until: 0,
+            });
+        attempt.failures = attempt.failures.saturating_add(1);
+        if attempt.failures >= 5 {
+            let exponent = attempt.failures.saturating_sub(5).min(5);
+            attempt.blocked_until = now.saturating_add(2u64.saturating_pow(exponent));
+        }
+        AuthError::InvalidCredentials
+    }
 }
 
 pub fn parse_scope(value: &str) -> Result<RepositoryScope, AuthError> {
@@ -635,5 +673,25 @@ mod tests {
             parse_scope("repository:team/app:push,unknown"),
             Err(AuthError::InvalidScope)
         ));
+    }
+
+    #[tokio::test]
+    async fn repeated_failed_logins_apply_backoff() {
+        let auth = AuthService::new("knotree-registry", "knotree-registry", 300);
+        auth.bootstrap_admin("admin", "correct horse battery staple")
+            .await
+            .expect("bootstrap");
+
+        for _ in 0..5 {
+            assert!(matches!(
+                auth.login("admin", "wrong password").await,
+                Err(AuthError::InvalidCredentials)
+            ));
+        }
+
+        let state = auth.state.read().await;
+        let attempt = state.login_attempts.get("admin").expect("login attempt");
+        assert_eq!(attempt.failures, 5);
+        assert!(attempt.blocked_until > now_seconds());
     }
 }

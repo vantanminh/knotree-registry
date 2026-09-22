@@ -25,8 +25,12 @@ The Vite development server proxies `/api`, `/auth`, and `/v2` to `http://127.0.
 | `GET /api/v1/auth/tokens` | List credential metadata without secrets. |
 | `POST /api/v1/auth/tokens` | Create a scoped credential; the generated secret is returned once. |
 | `POST /api/v1/auth/tokens/{id}/revoke` | Revoke a credential owned by the current user or by an administrator. |
+| `GET /api/v1/audit` | Return recent security-sensitive events for the current session. |
+| `GET /api/v1/webhooks` | List webhook endpoints without revealing secrets. |
+| `POST /api/v1/webhooks` | Create an admin-owned endpoint; the HMAC secret is returned once. |
+| `POST /api/v1/webhooks/{id}/disable` | Disable an endpoint without deleting delivery history. |
 | `POST /api/v1/admin/gc` | Run or dry-run mark-and-sweep garbage collection as an administrator. |
 
 Credential secrets are never returned by list endpoints. Action scopes are `pull`, `push`, `delete`, and `admin`; requested scopes are checked against the logged-in user’s credential before they reach the Docker Bearer token service.
 
-The current dashboard covers sign-in, overview, repository browsing, one-time token reveal/revoke, and security guidance. Namespace membership, audit history, webhooks, and agent settings remain separate service capabilities so they can be added without mixing browser cookies into the `/v2` protocol.
+The current dashboard covers sign-in, overview, repository browsing, one-time token reveal/revoke, and security guidance. Audit and webhook controls are available through the documented control-plane API; they remain separate from the `/v2` protocol so browser cookies never authorize registry requests.

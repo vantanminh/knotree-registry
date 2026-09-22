@@ -8,7 +8,7 @@ use registry_db::Database;
 use registry_events::{EventLog, WebhookRegistry};
 use registry_storage::{DynObjectStore, LocalFileStore, MemoryObjectStore, R2ObjectStore};
 
-use crate::{AppConfig, AppError, Catalog, StorageBackend, UploadManager};
+use crate::{AppConfig, AppError, Catalog, Metrics, StorageBackend, UploadManager};
 
 #[derive(Clone)]
 pub struct AppState {
@@ -20,6 +20,7 @@ pub struct AppState {
     pub uploads: Arc<UploadManager>,
     pub events: EventLog,
     pub webhooks: WebhookRegistry,
+    pub metrics: Metrics,
     pub started_at: Instant,
 }
 
@@ -90,6 +91,7 @@ impl AppState {
             uploads,
             events: EventLog::default(),
             webhooks: WebhookRegistry::default(),
+            metrics: Metrics::default(),
             started_at: Instant::now(),
         })
     }

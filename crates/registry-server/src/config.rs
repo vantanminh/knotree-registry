@@ -40,6 +40,7 @@ pub struct AppConfig {
     pub pull_mode: PullMode,
     pub edge_download_url: Option<String>,
     pub edge_download_secret: Option<String>,
+    pub control_plane_origins: Vec<String>,
 }
 
 #[derive(Debug, Error)]
@@ -132,6 +133,13 @@ impl AppConfig {
         let edge_download_secret = env::var("EDGE_DOWNLOAD_SECRET")
             .ok()
             .filter(|value| !value.trim().is_empty());
+        let control_plane_origins = env::var("CONTROL_PLANE_ORIGINS")
+            .unwrap_or_default()
+            .split(',')
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .map(str::to_owned)
+            .collect();
         let config = Self {
             bind_addr,
             public_url,
@@ -156,6 +164,7 @@ impl AppConfig {
             pull_mode,
             edge_download_url,
             edge_download_secret,
+            control_plane_origins,
         };
         config.validate()?;
         Ok(config)

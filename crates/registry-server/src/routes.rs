@@ -10,8 +10,8 @@ use axum::{
     http::{
         HeaderMap, HeaderName, HeaderValue, Method, Request, StatusCode,
         header::{
-            AUTHORIZATION, CONTENT_LENGTH, CONTENT_TYPE, COOKIE, ETAG, LINK, LOCATION, SET_COOKIE,
-            WWW_AUTHENTICATE,
+            AUTHORIZATION, CONTENT_LENGTH, CONTENT_TYPE, COOKIE, ETAG, LINK, LOCATION, ORIGIN,
+            SET_COOKIE, WWW_AUTHENTICATE,
         },
     },
     middleware::{self, Next},
@@ -41,6 +41,7 @@ pub fn router(state: AppState) -> Router {
         .route("/readyz", get(readyz))
         .route("/health/live", get(livez))
         .route("/health/ready", get(readyz))
+        .route("/metrics", get(metrics))
         .route("/v2/", get(distribution_version))
         .route("/v2/{*path}", any(oci_route))
         .route("/auth/token", get(token))
@@ -56,9 +57,89 @@ pub fn router(state: AppState) -> Router {
         .route("/api/v1/webhooks", get(list_webhooks).post(create_webhook))
         .route("/api/v1/webhooks/{id}/disable", post(disable_webhook))
         .route("/api/v1/admin/gc", post(run_gc))
-        .with_state(state)
+        .with_state(state.clone())
+        .layer(middleware::from_fn_with_state(
+            state.clone(),
+            control_body_limit,
+        ))
+        .layer(middleware::from_fn_with_state(
+            state.clone(),
+            metrics_middleware,
+        ))
         .layer(middleware::from_fn(request_id))
         .layer(TraceLayer::new_for_http())
+}
+
+async fn metrics_middleware(
+    State(state): State<AppState>,
+    request: Request<Body>,
+    next: Next,
+) -> Response {
+    state.metrics.observe_request();
+    let response = next.run(request).await;
+    state.metrics.observe_response(response.status().as_u16());
+    response
+}
+
+async fn control_body_limit(
+    State(state): State<AppState>,
+    request: Request<Body>,
+    next: Next,
+) -> Response {
+    let is_control_plane = request.uri().path().starts_with("/api/");
+    let is_state_change = !matches!(
+        *request.method(),
+        Method::GET | Method::HEAD | Method::OPTIONS
+    );
+    let csrf_violation = is_control_plane
+        && is_state_change
+        && request
+            .headers()
+            .get(ORIGIN)
+            .and_then(|value| value.to_str().ok())
+            .is_some_and(|origin| !allowed_origin(&state, origin));
+    if csrf_violation {
+        return (
+            StatusCode::FORBIDDEN,
+            Json(json!({"error": "origin_not_allowed"})),
+        )
+            .into_response();
+    }
+    let too_large = is_control_plane
+        && request
+            .headers()
+            .get(CONTENT_LENGTH)
+            .and_then(|value| value.to_str().ok())
+            .and_then(|value| value.parse::<usize>().ok())
+            .is_some_and(|length| length > state.config.request_body_limit_bytes);
+    if too_large {
+        return (
+            StatusCode::PAYLOAD_TOO_LARGE,
+            Json(json!({"error": "request_too_large"})),
+        )
+            .into_response();
+    }
+    next.run(request).await
+}
+
+fn allowed_origin(state: &AppState, origin: &str) -> bool {
+    if state
+        .config
+        .control_plane_origins
+        .iter()
+        .any(|allowed| allowed == origin)
+    {
+        return true;
+    }
+    let Ok(origin_url) = url::Url::parse(origin) else {
+        return false;
+    };
+    let Ok(public_url) = url::Url::parse(&state.config.public_url) else {
+        return false;
+    };
+    origin_url.scheme() == public_url.scheme()
+        && origin_url.host_str() == public_url.host_str()
+        && origin_url.port_or_known_default() == public_url.port_or_known_default()
 }
 
 async fn request_id(mut request: Request<Body>, next: Next) -> Response {
@@ -86,6 +167,13 @@ async fn index(State(state): State<AppState>) -> impl IntoResponse {
 
 async fn livez() -> impl IntoResponse {
     Json(json!({"status": "ok"}))
+}
+
+async fn metrics(State(state): State<AppState>) -> impl IntoResponse {
+    (
+        [(CONTENT_TYPE, "text/plain; version=0.0.4".to_owned())],
+        state.metrics.render_prometheus(),
+    )
 }
 
 async fn readyz(State(state): State<AppState>) -> impl IntoResponse {
@@ -305,13 +393,21 @@ async fn put_manifest_response(
             );
         }
     };
+    let is_tag = Digest::parse(reference).is_err();
     let mut event = RegistryEvent::new(EventKind::ManifestPushed);
     event.repository = Some(repository.to_string());
     event.digest = Some(manifest.digest.to_string());
-    if Digest::parse(reference).is_err() {
+    if is_tag {
         event.tag = Some(reference.to_owned());
     }
     state.events.record(event).await;
+    if is_tag {
+        let mut tag_event = RegistryEvent::new(EventKind::TagUpdated);
+        tag_event.repository = Some(repository.to_string());
+        tag_event.tag = Some(reference.to_owned());
+        tag_event.digest = Some(manifest.digest.to_string());
+        state.events.record(tag_event).await;
+    }
     let mut response = StatusCode::CREATED.into_response();
     response.headers_mut().insert(
         LOCATION,
@@ -458,6 +554,7 @@ async fn upload_start(
     token: &str,
     request: Request<Body>,
 ) -> Response {
+    let _ = state.uploads.cleanup_expired(&state.store).await;
     let query = request.uri().query().unwrap_or_default();
     if let Some(mount) = query_value(query, "mount")
         && let Ok(digest) = Digest::parse(&mount)
@@ -1067,7 +1164,15 @@ async fn login(
     State(state): State<AppState>,
     Json(input): Json<LoginRequest>,
 ) -> Result<Response, crate::AppError> {
-    let session = state.auth.login(&input.username, &input.password).await?;
+    let session = match state.auth.login(&input.username, &input.password).await {
+        Ok(session) => session,
+        Err(error) => {
+            let mut event = RegistryEvent::new(EventKind::LoginFailed);
+            event.actor = Some(input.username.clone());
+            state.events.record(event).await;
+            return Err(error.into());
+        }
+    };
     let mut event = RegistryEvent::new(EventKind::LoginSucceeded);
     event.actor = Some(input.username.clone());
     state.events.record(event).await;
@@ -1429,6 +1534,7 @@ mod tests {
             pull_mode: PullMode::Proxy,
             edge_download_url: None,
             edge_download_secret: None,
+            control_plane_origins: Vec::new(),
         }
     }
 

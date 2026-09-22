@@ -20,6 +20,8 @@ export type RepositoryDetail = {
   visibility: string;
   tags: { tag: string; digest: string; media_type: string; size: number; created_at: number }[];
 };
+export type AuditEvent = { id: string; kind: string; occurred_at: number; actor: string | null; repository: string | null; tag: string | null; digest: string | null; metadata: Record<string, unknown> };
+export type Webhook = { id: string; url: string; events: string[]; enabled: boolean; created_at: number };
 
 export async function api<T>(path: string, init: RequestInit = {}): Promise<T> {
   const response = await fetch(path, {

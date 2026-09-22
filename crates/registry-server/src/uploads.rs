@@ -198,6 +198,27 @@ impl UploadManager {
         Ok(())
     }
 
+    pub async fn cleanup_expired(&self, store: &DynObjectStore) -> usize {
+        let entries = self
+            .sessions
+            .read()
+            .await
+            .iter()
+            .map(|(id, entry)| (*id, Arc::clone(entry)))
+            .collect::<Vec<_>>();
+        let now = now_seconds();
+        let mut cleaned = 0;
+        for (_, entry) in entries {
+            let mut state = entry.state.lock().await;
+            if state.status == UploadStatusKind::Active && state.expires_at <= now {
+                let _ = store.delete(&entry.staging_key).await;
+                state.status = UploadStatusKind::Aborted;
+                cleaned += 1;
+            }
+        }
+        cleaned
+    }
+
     async fn entry(&self, id: Uuid) -> Result<Arc<UploadEntry>, UploadError> {
         self.sessions
             .read()
@@ -293,6 +314,25 @@ mod tests {
         assert_eq!(
             store.get(&blob_key(&digest)).await.expect("blob"),
             Bytes::from_static(b"hello")
+        );
+    }
+
+    #[tokio::test]
+    async fn cleanup_aborts_expired_staging_sessions() {
+        let store: DynObjectStore = Arc::new(MemoryObjectStore::default());
+        let manager = UploadManager::new(Duration::from_secs(1));
+        let created = manager
+            .create(RepositoryName::parse("team/app").expect("repository"))
+            .await;
+        manager
+            .append(created.id, 0, Bytes::from_static(b"stale"), &store)
+            .await
+            .expect("append");
+        tokio::time::sleep(Duration::from_millis(1_100)).await;
+        assert_eq!(manager.cleanup_expired(&store).await, 1);
+        assert_eq!(
+            manager.status(created.id).await.expect("status").status,
+            UploadStatusKind::Aborted
         );
     }
 }
