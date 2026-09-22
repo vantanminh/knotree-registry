@@ -1,100 +1,463 @@
-import { FormEvent, useEffect, useState } from "react";
-import { api, AuditEvent, formatDate, Overview, Repository, RepositoryDetail, Token, User, Webhook } from "./api";
+import { useEffect, useState } from "react";
+import { Link, Navigate, Outlet, Route, Routes, useLocation, useNavigate, useSearchParams } from "react-router-dom";
+import {
+  Activity,
+  Box,
+  Boxes,
+  ChevronLeft,
+  ChevronRight,
+  KeyRound,
+  LayoutDashboard,
+  Menu,
+  Moon,
+  Server,
+  Settings,
+  Sun,
+  Terminal,
+  Trash2,
+  Upload,
+  Users,
+  Webhook,
+  HardDrive,
+  ScrollText,
+  CircleDot
+} from "lucide-react";
+import { Instance, User, api, friendlyError } from "./api";
+import { LoginPage, OverviewPage, StatusPage, ActivityPage } from "./pages-overview";
+import { NamespacesPage, RepositoriesPage, RepositoryDetailPage } from "./pages-repos";
+import { TokenDetailPage, TokensPage } from "./pages-tokens";
+import {
+  AuditPage,
+  GarbageCollectionPage,
+  MembersPage,
+  PlaceholderPage,
+  SecuritySettingsPage,
+  SettingsPage,
+  StoragePage,
+  UploadsPage,
+  WebhooksPage
+} from "./pages-ops";
+import { ToastProvider, useCollapsed, useTheme } from "./ui";
 
-type Page = "overview" | "repositories" | "tokens" | "security" | "audit" | "webhooks";
-type ApiError = Error & { status?: number };
+type NavItem = { to: string; label: string; icon: typeof LayoutDashboard; admin?: boolean };
+
+const nav: { label: string; items: NavItem[] }[] = [
+  { label: "Overview", items: [{ to: "/", label: "Overview", icon: LayoutDashboard }] },
+  {
+    label: "Registry",
+    items: [
+      { to: "/repositories", label: "Repositories", icon: Box },
+      { to: "/namespaces", label: "Namespaces", icon: Boxes },
+      { to: "/uploads", label: "Uploads", icon: Upload, admin: true }
+    ]
+  },
+  {
+    label: "Deployments",
+    items: [
+      { to: "/deployments/watchers", label: "Watchers", icon: CircleDot },
+      { to: "/deployments/agents", label: "Agents", icon: Server }
+    ]
+  },
+  {
+    label: "Operations",
+    items: [
+      { to: "/activity", label: "Activity", icon: Activity },
+      { to: "/operations/webhooks", label: "Webhooks", icon: Webhook },
+      { to: "/operations/storage", label: "Storage", icon: HardDrive },
+      { to: "/operations/garbage-collection", label: "Garbage Collection", icon: Trash2, admin: true }
+    ]
+  },
+  {
+    label: "Security",
+    items: [
+      { to: "/security/tokens", label: "Access Tokens", icon: KeyRound },
+      { to: "/namespaces/members", label: "Members", icon: Users },
+      { to: "/security/audit", label: "Audit Log", icon: ScrollText }
+    ]
+  },
+  { label: "Settings", items: [{ to: "/settings/general", label: "Settings", icon: Settings }] }
+];
 
 export default function App() {
-  const [user, setUser] = useState<User | null>(null);
-  const [loading, setLoading] = useState(true);
-  const [error, setError] = useState("");
+  return (
+    <ToastProvider>
+      <Routes>
+        <Route path="/login" element={<AuthGate />} />
+        <Route element={<RequireAuth />}>
+          <Route element={<Shell />}>
+            <Route path="/" element={<OverviewRoute />} />
+            <Route path="/repositories" element={<ReposRoute />} />
+            <Route path="/repositories/*" element={<RepoDetailRoute />} />
+            <Route path="/namespaces" element={<NamespacesPage />} />
+            <Route path="/namespaces/members" element={<MembersPage />} />
+            <Route path="/uploads" element={<UploadsRoute />} />
+            <Route path="/deployments/watchers" element={<PlaceholderPage title="Watchers" text="Deployment watchers track a tag or digest on a target host. No watchers are registered on this instance." />} />
+            <Route path="/deployments/agents" element={<PlaceholderPage title="Agents" text="VPS agents report heartbeat and desired digest. Agent registration is not enabled on this control plane." />} />
+            <Route path="/activity" element={<ActivityPage />} />
+            <Route path="/operations/storage" element={<StoragePage />} />
+            <Route path="/operations/webhooks" element={<WebhooksRoute />} />
+            <Route path="/operations/garbage-collection" element={<GcRoute />} />
+            <Route path="/security/tokens" element={<TokensRoute />} />
+            <Route path="/security/tokens/:id" element={<TokenDetailPage />} />
+            <Route path="/security/audit" element={<AuditPage />} />
+            <Route path="/settings/general" element={<SettingsRoute />} />
+            <Route path="/settings/registry" element={<SettingsRoute />} />
+            <Route path="/settings/security" element={<AccountSecurityRoute />} />
+            <Route path="/settings/retention" element={<SettingsRoute />} />
+            <Route path="/account/security" element={<AccountSecurityRoute />} />
+            <Route path="/status" element={<StatusPage />} />
+            <Route path="*" element={<Navigate to="/" replace />} />
+          </Route>
+        </Route>
+      </Routes>
+    </ToastProvider>
+  );
+}
 
+function AuthGate() {
+  const [user, setUser] = useState<User | null | undefined>(undefined);
+  const [params] = useSearchParams();
   useEffect(() => {
     api<User>("/api/v1/auth/me")
       .then(setUser)
-      .catch((reason: ApiError) => { if (reason.status !== 401) setError(reason.message); })
-      .finally(() => setLoading(false));
+      .catch(() => setUser(null));
   }, []);
-
-  if (loading) return <div className="screen-center"><span className="spinner" /> Loading workspace</div>;
-  if (!user) return <Login onLogin={setUser} error={error} />;
-  return <Shell user={user} onLogout={() => setUser(null)} />;
+  if (user === undefined) return <div className="auth-shell">Loading…</div>;
+  if (user) return <Navigate to={params.get("returnTo") || "/"} replace />;
+  return (
+    <LoginPage
+      onLogin={() => {
+        window.location.assign(params.get("returnTo") || "/");
+      }}
+    />
+  );
 }
 
-function Login({ onLogin, error: initialError }: { onLogin: (user: User) => void; error: string }) {
-  const [username, setUsername] = useState("admin");
-  const [password, setPassword] = useState("");
-  const [error, setError] = useState(initialError);
-  const [busy, setBusy] = useState(false);
-  async function submit(event: FormEvent) {
-    event.preventDefault(); setBusy(true); setError("");
-    try { const result = await api<{ user: User }>("/api/v1/auth/login", { method: "POST", body: JSON.stringify({ username, password }) }); onLogin(result.user); }
-    catch (reason) { setError((reason as Error).message === "unauthorized" ? "The username or password is incorrect." : (reason as Error).message); }
-    finally { setBusy(false); }
-  }
-  return <div className="auth-shell"><div className="auth-card">
-    <div className="brand-mark">K</div><p className="eyebrow">PRIVATE IMAGE INFRASTRUCTURE</p><h1>Welcome back.</h1><p className="muted">Sign in to manage your repositories, credentials, and delivery surface.</p>
-    <form onSubmit={submit} className="stack-lg"><label>Username<input autoComplete="username" value={username} onChange={event => setUsername(event.target.value)} required /></label><label>Password<input type="password" autoComplete="current-password" value={password} onChange={event => setPassword(event.target.value)} required /></label>{error && <div className="alert error" role="alert">{error}</div>}<button className="button primary full" disabled={busy}>{busy ? "Signing in…" : "Sign in"}</button></form>
-    <p className="tiny muted">Private by default · OCI Distribution API · R2-ready storage</p>
-  </div></div>;
+function RequireAuth() {
+  const [user, setUser] = useState<User | null | undefined>(undefined);
+  const location = useLocation();
+  useEffect(() => {
+    api<User>("/api/v1/auth/me")
+      .then(setUser)
+      .catch((reason) => {
+        if ((reason as { status?: number }).status === 401) setUser(null);
+        else setUser(null);
+      });
+  }, []);
+  if (user === undefined) return <div className="auth-shell">Loading workspace…</div>;
+  if (!user) return <Navigate to={`/login?returnTo=${encodeURIComponent(location.pathname + location.search)}`} replace />;
+  return <Outlet context={{ user } satisfies { user: User }} />;
 }
 
-function Shell({ user, onLogout }: { user: User; onLogout: () => void }) {
-  const [page, setPage] = useState<Page>("overview");
+function Shell() {
+  const [user, setUser] = useState<User | null>(null);
+  const [instance, setInstance] = useState<Instance | null>(null);
   const [menuOpen, setMenuOpen] = useState(false);
-  async function logout() { await api<void>("/api/v1/auth/logout", { method: "POST" }); onLogout(); }
-  const nav: [Page, string, string][] = [["overview", "Overview", "⌂"], ["repositories", "Repositories", "◈"], ["tokens", "Access tokens", "◇"], ["webhooks", "Webhooks", "⌁"], ["audit", "Audit log", "≡"], ["security", "Security", "⊙"]];
-  return <div className="app-shell"><aside className={menuOpen ? "sidebar open" : "sidebar"}><div className="sidebar-top"><div className="brand-lockup"><span className="brand-mini">K</span><span>Knotree<span className="brand-soft">Registry</span></span></div><button className="close-nav" onClick={() => setMenuOpen(false)} aria-label="Close navigation">×</button></div><div className="workspace-switcher"><span className="status-dot" /> Private workspace <span className="chevron">⌄</span></div><nav aria-label="Primary navigation">{nav.map(([key, label, icon]) => <button className={page === key ? "nav-item active" : "nav-item"} key={key} onClick={() => { setPage(key); setMenuOpen(false); }}><span className="nav-icon">{icon}</span>{label}</button>)}</nav><div className="sidebar-foot"><div className="help-card"><span className="help-icon">?</span><div><strong>Need a hand?</strong><small>Read the operator guide</small></div></div><div className="user-row"><span className="avatar">{user.username.slice(0, 1).toUpperCase()}</span><div className="user-label"><strong>{user.username}</strong><small>{user.is_admin ? "Administrator" : "Member"}</small></div><button className="more" onClick={logout} title="Sign out">↪</button></div></div></aside><main className="main"><header className="topbar"><button className="menu-toggle" onClick={() => setMenuOpen(true)} aria-label="Open navigation">☰</button><div className="breadcrumbs"><span>Knotree</span><span>/</span><strong>{nav.find(item => item[0] === page)?.[1]}</strong></div><div className="top-actions"><span className="live-indicator"><i /> All systems nominal</span><button className="icon-button" title="Sign out" onClick={logout}>↪</button></div></header><div className="content"><PageContent page={page} /></div></main></div>;
+  const [palette, setPalette] = useState(false);
+  const { collapsed, setCollapsed } = useCollapsed();
+  const { theme, setTheme } = useTheme();
+  const location = useLocation();
+  const navigate = useNavigate();
+  useEffect(() => {
+    api<User>("/api/v1/auth/me").then(setUser).catch(() => setUser(null));
+    api<Instance>("/api/v1/instance").then(setInstance).catch(() => setInstance(null));
+  }, []);
+  useEffect(() => {
+    setMenuOpen(false);
+  }, [location.pathname]);
+  useEffect(() => {
+    const onKey = (event: KeyboardEvent) => {
+      if ((event.metaKey || event.ctrlKey) && event.key.toLowerCase() === "k") {
+        event.preventDefault();
+        setPalette(true);
+      }
+      if (event.key === "/" && (event.target as HTMLElement).tagName !== "INPUT" && (event.target as HTMLElement).tagName !== "TEXTAREA") {
+        const search = document.querySelector<HTMLInputElement>("input[aria-label='Search repositories'], input[aria-label='Search tokens'], input[aria-label='Search...']");
+        if (search) {
+          event.preventDefault();
+          search.focus();
+        }
+      }
+    };
+    window.addEventListener("keydown", onKey);
+    return () => window.removeEventListener("keydown", onKey);
+  }, []);
+  if (!user) return <div className="auth-shell">Loading workspace…</div>;
+  const host = instance?.registry_host ?? "registry.knotree.org";
+  const visible = nav
+    .map((group) => ({
+      ...group,
+      items: group.items.filter((item) => !item.admin || user.is_admin)
+    }))
+    .filter((group) => group.items.length);
+  const crumbs = breadcrumb(location.pathname);
+  async function logout() {
+    await api("/api/v1/auth/logout", { method: "POST" });
+    navigate("/login");
+  }
+  return (
+    <div className="app-shell">
+      <aside className={`sidebar ${collapsed ? "collapsed" : ""} ${menuOpen ? "open" : ""}`}>
+        <div className="sidebar-head">
+          <div className="brand">
+            <span className="brand-mark" style={{ margin: 0, width: 28, height: 28, fontSize: 12 }}>
+              K
+            </span>
+            <span className="brand-copy">
+              Knotree
+              <small>Registry</small>
+            </span>
+          </div>
+          <button className="btn icon ghost close-nav" onClick={() => setMenuOpen(false)} aria-label="Close navigation">
+            <ChevronLeft size={16} />
+          </button>
+        </div>
+        <div className="nav-scroll">
+          {visible.map((group) => (
+            <div className="nav-group" key={group.label}>
+              <div className="nav-group-label">{group.label}</div>
+              {group.items.map((item) => {
+                const active = item.to === "/" ? location.pathname === "/" : location.pathname.startsWith(item.to);
+                return (
+                  <Link key={item.to} className={active ? "nav-item active" : "nav-item"} to={item.to} title={item.label}>
+                    <item.icon />
+                    <span className="nav-label">{item.label}</span>
+                  </Link>
+                );
+              })}
+            </div>
+          ))}
+        </div>
+        <div className="sidebar-foot">
+          <Link className="nav-item" to="/status">
+            <CircleDot />
+            <span className="nav-label">Status</span>
+          </Link>
+          <a className="nav-item" href="https://github.com/knotree/registry" target="_blank" rel="noreferrer">
+            <Terminal />
+            <span className="nav-label">Documentation</span>
+          </a>
+          <div className="user-row">
+            <span className="avatar">{user.username.slice(0, 1).toUpperCase()}</span>
+            <div className="user-meta">
+              <strong>{user.username}</strong>
+              <span>{user.is_admin ? "Administrator" : "Member"}</span>
+            </div>
+            <button className="btn icon ghost" onClick={logout} title="Sign out" aria-label="Sign out">
+              <ChevronRight size={16} />
+            </button>
+          </div>
+        </div>
+      </aside>
+      <div className="main">
+        <header className="topbar">
+          <button className="btn icon ghost menu-toggle" onClick={() => setMenuOpen(true)} aria-label="Open navigation">
+            <Menu size={16} />
+          </button>
+          <button className="btn icon ghost" onClick={() => setCollapsed(!collapsed)} aria-label="Collapse sidebar">
+            {collapsed ? <ChevronRight size={16} /> : <ChevronLeft size={16} />}
+          </button>
+          <nav className="crumbs" aria-label="Breadcrumb">
+            {crumbs.map((crumb, index) => (
+              <span key={crumb.to}>
+                {index > 0 && " / "}
+                {index === crumbs.length - 1 ? <strong>{crumb.label}</strong> : <Link to={crumb.to}>{crumb.label}</Link>}
+              </span>
+            ))}
+          </nav>
+          <div className="top-actions">
+            <span className="env-chip">
+              <i className="dot ok" />
+              {instance?.environment ?? "private"}
+            </span>
+            <button className="kbd" onClick={() => setPalette(true)}>
+              ⌘ K
+            </button>
+            <Link className="btn primary sm" to="/security/tokens?create=1">
+              Create
+            </Link>
+            <button
+              className="btn icon ghost"
+              onClick={() => setTheme(theme === "light" ? "dark" : theme === "dark" ? "system" : "light")}
+              aria-label="Toggle theme"
+              title={`Theme: ${theme}`}
+            >
+              {theme === "light" ? <Sun size={16} /> : <Moon size={16} />}
+            </button>
+            <Link to="/account/security" className="avatar" aria-label="Account">
+              {user.username.slice(0, 1).toUpperCase()}
+            </Link>
+          </div>
+        </header>
+        <div className="content">
+          <Outlet context={{ user, instance, host }} />
+        </div>
+      </div>
+      {palette && (
+        <CommandPalette
+          admin={user.is_admin}
+          host={host}
+          onClose={() => setPalette(false)}
+          onNavigate={(path) => {
+            setPalette(false);
+            navigate(path);
+          }}
+        />
+      )}
+    </div>
+  );
 }
 
-function PageContent({ page }: { page: Page }) { if (page === "overview") return <OverviewPage />; if (page === "repositories") return <RepositoriesPage />; if (page === "tokens") return <TokensPage />; if (page === "webhooks") return <WebhooksPage />; if (page === "audit") return <AuditPage />; return <SecurityPage />; }
-
-function OverviewPage() {
-  const [data, setData] = useState<Overview | null>(null); const [error, setError] = useState("");
-  useEffect(() => { api<Overview>("/api/v1/overview").then(setData).catch(reason => setError((reason as Error).message)); }, []);
-  if (error) return <ErrorState message={error} />; if (!data) return <Loading />;
-  return <><PageIntro eyebrow="WORKSPACE OVERVIEW" title={`Good to see you, ${data.user.username}.`} description="A calm view of the registry surface that matters: what is stored, who can access it, and what changed." action={<button className="button primary" onClick={() => navigator.clipboard?.writeText("docker login registry.example.com")}>Copy login example</button>} /><div className="metrics-grid"><Metric label="Repositories" value={String(data.repository_count)} detail="Private namespaces" icon="◈" /><Metric label="Active tokens" value={String(data.active_token_count)} detail="Revocable credentials" icon="◇" /><Metric label="Storage mode" value="Private" detail="R2-backed in production" icon="⬡" /></div><div className="two-col"><section className="panel"><PanelTitle title="Quick start" detail="A secure path to your first push" /><div className="steps"><Step number="01" title="Create a scoped token" text="Limit it to one repository and the actions it needs." /><Step number="02" title="Authenticate Docker" text="Use the generated secret once with docker login." /><Step number="03" title="Push by digest" text="Tags are convenient; immutable digests are your safety rail." /></div></section><section className="panel"><PanelTitle title="Your repositories" action={<span className="subtle-link">View all →</span>} />{data.repositories.length ? <div className="list">{data.repositories.slice(0, 5).map(repo => <div className="list-row" key={repo}><span className="repo-icon">◈</span><div><strong>{repo}</strong><small>Private repository</small></div><span className="row-arrow">→</span></div>)}</div> : <EmptyState title="No repositories yet" text="Push your first manifest to see it here." />}</section></div></>;
+function breadcrumb(path: string): { to: string; label: string }[] {
+  if (path === "/") return [{ to: "/", label: "Overview" }];
+  const parts = path.split("/").filter(Boolean);
+  const crumbs = [{ to: "/", label: "Knotree" }];
+  let acc = "";
+  for (const part of parts) {
+    acc += `/${part}`;
+    crumbs.push({ to: acc, label: decodeURIComponent(part) });
+  }
+  return crumbs;
 }
 
-function RepositoriesPage() {
-  const [repos, setRepos] = useState<Repository[]>([]); const [selected, setSelected] = useState<RepositoryDetail | null>(null); const [error, setError] = useState("");
-  useEffect(() => { api<{ repositories: Repository[] }>("/api/v1/repositories").then(result => { setRepos(result.repositories); if (result.repositories[0]) return api<RepositoryDetail>(`/api/v1/repositories/${encodeURI(result.repositories[0].name)}`).then(setSelected); }).catch(reason => setError((reason as Error).message)); }, []);
-  if (error) return <ErrorState message={error} />;
-  return <><PageIntro eyebrow="REGISTRY INVENTORY" title="Repositories" description="Browse tags, immutable digests, and the media types your clients can pull." /><div className="repo-layout"><section className="panel repo-list-panel"><div className="panel-heading"><div><h2>All repositories</h2><p>{repos.length} private repositories</p></div><button className="button quiet">＋ New</button></div>{repos.length ? repos.map(repo => <button key={repo.name} className={selected?.name === repo.name ? "repo-select selected" : "repo-select"} onClick={() => api<RepositoryDetail>(`/api/v1/repositories/${encodeURI(repo.name)}`).then(setSelected)}><span className="repo-icon">◈</span><span><strong>{repo.name}</strong><small>Private</small></span><span className="row-arrow">→</span></button>) : <EmptyState title="Nothing here yet" text="Push an image to create a repository." />}</section><section className="panel repo-detail">{selected ? <><div className="detail-head"><div><p className="eyebrow">REPOSITORY</p><h2>{selected.name}</h2><span className="badge">Private</span></div><button className="button quiet" onClick={() => navigator.clipboard?.writeText(`docker pull registry.example.com/${selected.name}:latest`)}>Copy pull command</button></div><div className="table-wrap"><table><thead><tr><th>Tag</th><th>Digest</th><th>Media type</th><th>Size</th><th>Pushed</th></tr></thead><tbody>{selected.tags.length ? selected.tags.map(tag => <tr key={tag.tag}><td><span className="tag">{tag.tag}</span></td><td><code>{tag.digest.slice(0, 19)}…</code></td><td className="muted">{tag.media_type.split(".").slice(-1)[0]}</td><td className="muted">{formatBytes(tag.size)}</td><td className="muted">{formatDate(tag.created_at)}</td></tr>) : <tr><td colSpan={5}><EmptyState title="No tags yet" text="This repository has no published manifests." /></td></tr>}</tbody></table></div></> : <EmptyState title="Select a repository" text="Repository metadata will appear here." />}</section></div></>;
+function CommandPalette({
+  admin,
+  host,
+  onClose,
+  onNavigate
+}: {
+  admin: boolean;
+  host: string;
+  onClose: () => void;
+  onNavigate: (path: string) => void;
+}) {
+  const [query, setQuery] = useState("");
+  const [active, setActive] = useState(0);
+  const [repos, setRepos] = useState<string[]>([]);
+  useEffect(() => {
+    api<{ repositories: { name: string }[] }>("/api/v1/repositories")
+      .then((result) => setRepos(result.repositories.map((repo) => repo.name)))
+      .catch(() => setRepos([]));
+  }, []);
+  const actions = [
+    { group: "Actions", label: "Create access token", to: "/security/tokens?create=1" },
+    { group: "Actions", label: "Create repository", to: "/repositories" },
+    { group: "Actions", label: "Open audit logs", to: "/security/audit" },
+    { group: "Actions", label: "Open webhooks", to: "/operations/webhooks" },
+    { group: "Actions", label: "Open settings", to: "/settings/general" },
+    { group: "Actions", label: "Copy Docker login command", to: `copy:docker login ${host}` },
+    ...(admin ? [{ group: "Actions", label: "Garbage collection", to: "/operations/garbage-collection" }] : [])
+  ];
+  const items = [
+    ...repos
+      .filter((name) => name.includes(query.toLowerCase()) || query.startsWith("sha256"))
+      .map((name) => ({ group: "Repositories", label: name, to: `/repositories/${name}` })),
+    ...actions.filter((item) => item.label.toLowerCase().includes(query.toLowerCase()) || !query)
+  ];
+  useEffect(() => {
+    const onKey = (event: KeyboardEvent) => {
+      if (event.key === "Escape") onClose();
+      if (event.key === "ArrowDown") {
+        event.preventDefault();
+        setActive((value) => Math.min(items.length - 1, value + 1));
+      }
+      if (event.key === "ArrowUp") {
+        event.preventDefault();
+        setActive((value) => Math.max(0, value - 1));
+      }
+      if (event.key === "Enter" && items[active]) {
+        event.preventDefault();
+        choose(items[active].to);
+      }
+    };
+    window.addEventListener("keydown", onKey);
+    return () => window.removeEventListener("keydown", onKey);
+  });
+  async function choose(to: string) {
+    if (to.startsWith("copy:")) {
+      await navigator.clipboard.writeText(to.slice(5));
+      onClose();
+      return;
+    }
+    onNavigate(to);
+  }
+  const groups = Array.from(new Set(items.map((item) => item.group)));
+  return (
+    <div className="overlay" onMouseDown={onClose}>
+      <div className="palette" onMouseDown={(event) => event.stopPropagation()} role="dialog" aria-label="Command palette">
+        <input autoFocus placeholder="Search commands or resources" value={query} onChange={(event) => { setQuery(event.target.value); setActive(0); }} />
+        <div className="palette-list">
+          {groups.map((group) => (
+            <div key={group}>
+              <div className="group-title">{group}</div>
+              {items
+                .filter((item) => item.group === group)
+                .map((item) => {
+                  const index = items.indexOf(item);
+                  return (
+                    <button key={item.to} className={index === active ? "palette-item active" : "palette-item"} onClick={() => choose(item.to)}>
+                      {item.label}
+                      <small>{item.to.startsWith("copy:") ? "Copy" : "Open"}</small>
+                    </button>
+                  );
+                })}
+            </div>
+          ))}
+          {!items.length && <div className="empty">No matching commands</div>}
+        </div>
+      </div>
+    </div>
+  );
 }
 
-function TokensPage() {
-  const [tokens, setTokens] = useState<Token[]>([]); const [secret, setSecret] = useState(""); const [formOpen, setFormOpen] = useState(false); const [busy, setBusy] = useState(false); const [error, setError] = useState("");
-  const refresh = () => api<{ tokens: Token[] }>("/api/v1/auth/tokens").then(result => setTokens(result.tokens)).catch(reason => setError((reason as Error).message));
-  useEffect(() => { void refresh(); }, []);
-  async function create(event: FormEvent<HTMLFormElement>) { event.preventDefault(); setBusy(true); setError(""); const data = new FormData(event.currentTarget); const actions = ["pull", ...(data.get("push") ? ["push"] : []), ...(data.get("delete") ? ["delete"] : [])]; try { const result = await api<Token & { secret: string }>("/api/v1/auth/tokens", { method: "POST", body: JSON.stringify({ name: data.get("name"), scopes: [{ repository: data.get("repository"), actions }] }) }); setSecret(result.secret); setFormOpen(false); refresh(); } catch (reason) { setError((reason as Error).message); } finally { setBusy(false); } }
-  async function revoke(id: string) { if (!window.confirm("Revoke this credential? Existing short-lived registry tokens remain valid only until their TTL.")) return; await api(`/api/v1/auth/tokens/${id}/revoke`, { method: "POST" }); refresh(); }
-  return <><PageIntro eyebrow="CREDENTIALS" title="Access tokens" description="Create narrow, revocable credentials for Docker, CI, and deployment agents." action={<button className="button primary" onClick={() => setFormOpen(true)}>＋ Create token</button>} />{secret && <div className="alert success"><div><strong>Copy this secret now.</strong><span>It will not be shown again.</span><code>{secret}</code></div><button className="button quiet" onClick={() => navigator.clipboard?.writeText(secret)}>Copy secret</button></div>}{error && <div className="alert error">{error}</div>}{formOpen && <section className="panel form-panel"><PanelTitle title="New access token" detail="Secrets are revealed once and stored only as verifiers." /><form onSubmit={create} className="token-form"><label>Name<input name="name" placeholder="ci-production" required /></label><label>Repository<input name="repository" placeholder="team/app" required /></label><fieldset><legend>Actions</legend><label className="check"><input type="checkbox" name="pull" defaultChecked disabled /> Pull <small>Required</small></label><label className="check"><input type="checkbox" name="push" /> Push</label><label className="check"><input type="checkbox" name="delete" /> Delete</label></fieldset><div className="form-actions"><button type="button" className="button quiet" onClick={() => setFormOpen(false)}>Cancel</button><button className="button primary" disabled={busy}>{busy ? "Creating…" : "Create token"}</button></div></form></section>}<section className="panel"><PanelTitle title="Issued credentials" detail="Only prefixes and metadata are retained here." />{tokens.length ? <div className="table-wrap"><table><thead><tr><th>Name</th><th>Scope</th><th>Last used</th><th>State</th><th /></tr></thead><tbody>{tokens.map(token => <tr key={token.id}><td><strong>{token.name}</strong><small className="block">{token.prefix}…</small></td><td>{token.scopes.map(scope => <span className="scope-pill" key={scope.repository}>{scope.repository} · {scope.actions.join(", ")}</span>)}</td><td className="muted">{formatDate(token.last_used_at)}</td><td><span className={token.revoked_at ? "badge danger" : "badge green"}>{token.revoked_at ? "Revoked" : "Active"}</span></td><td>{!token.revoked_at && <button className="text-button danger-text" onClick={() => revoke(token.id)}>Revoke</button>}</td></tr>)}</tbody></table></div> : <EmptyState title="No credentials yet" text="Create a scoped token for your first Docker login." />}</section></>;
+function OverviewRoute() {
+  const host = useHost();
+  return <OverviewPage host={host} />;
+}
+function ReposRoute() {
+  return <RepositoriesPage host={useHost()} />;
+}
+function RepoDetailRoute() {
+  return <RepositoryDetailPage host={useHost()} />;
+}
+function TokensRoute() {
+  const user = useSessionUser();
+  return <TokensPage host={useHost()} username={user.username} />;
+}
+function UploadsRoute() {
+  return <UploadsPage admin={useSessionUser().is_admin} />;
+}
+function WebhooksRoute() {
+  return <WebhooksPage admin={useSessionUser().is_admin} />;
+}
+function GcRoute() {
+  return <GarbageCollectionPage admin={useSessionUser().is_admin} />;
+}
+function SettingsRoute() {
+  const [instance, setInstance] = useState<Instance | null>(null);
+  useEffect(() => {
+    api<Instance>("/api/v1/instance").then(setInstance).catch(() => setInstance(null));
+  }, []);
+  return <SettingsPage instance={instance} />;
+}
+function AccountSecurityRoute() {
+  return <SecuritySettingsPage user={useSessionUser()} />;
 }
 
-function AuditPage() {
-  const [events, setEvents] = useState<AuditEvent[]>([]); const [error, setError] = useState("");
-  useEffect(() => { api<{ events: AuditEvent[] }>("/api/v1/audit?limit=100").then(result => setEvents(result.events)).catch(reason => setError((reason as Error).message)); }, []);
-  if (error) return <ErrorState message={error} />;
-  return <><PageIntro eyebrow="SECURITY HISTORY" title="Audit log" description="A concise trail of credential, webhook, manifest, and maintenance changes." /><section className="panel"><PanelTitle title="Recent events" detail="Sensitive values and bearer material are never included." />{events.length ? <div className="audit-list">{events.map(event => <div className="audit-row" key={event.id}><span className="audit-mark">{event.kind === "login_succeeded" ? "✓" : "·"}</span><div><strong>{event.kind.replaceAll("_", " ")}</strong><small>{event.actor ?? "system"}{event.repository ? ` · ${event.repository}` : ""}{event.tag ? `:${event.tag}` : ""}</small></div><time>{formatDate(event.occurred_at)}</time></div>)}</div> : <EmptyState title="No events yet" text="Security-sensitive activity will appear here." />}</section></>;
+function useHost(): string {
+  const [host, setHost] = useState("registry.knotree.org");
+  useEffect(() => {
+    api<Instance>("/api/v1/instance")
+      .then((instance) => setHost(instance.registry_host))
+      .catch(() => undefined);
+  }, []);
+  return host;
 }
 
-function WebhooksPage() {
-  const [webhooks, setWebhooks] = useState<Webhook[]>([]); const [secret, setSecret] = useState(""); const [url, setUrl] = useState(""); const [error, setError] = useState("");
-  const refresh = () => api<{ webhooks: Webhook[] }>("/api/v1/webhooks").then(result => setWebhooks(result.webhooks)).catch(reason => setError((reason as Error).message));
-  useEffect(() => { void refresh(); }, []);
-  async function create(event: FormEvent) { event.preventDefault(); setError(""); try { const result = await api<{ webhook: Webhook; secret: string }>("/api/v1/webhooks", { method: "POST", body: JSON.stringify({ url, events: ["manifest_pushed", "tag_updated", "manifest_deleted"] }) }); setSecret(result.secret); setUrl(""); refresh(); } catch (reason) { setError((reason as Error).message); } }
-  async function disable(id: string) { if (!window.confirm("Disable this webhook?")) return; await api(`/api/v1/webhooks/${id}/disable`, { method: "POST" }); refresh(); }
-  return <><PageIntro eyebrow="EVENT DELIVERY" title="Webhooks" description="Deliver signed registry events to an explicitly configured endpoint." />{secret && <div className="alert success"><div><strong>Save this webhook secret now.</strong><span>It is not returned by list requests.</span><code>{secret}</code></div><button className="button quiet" onClick={() => navigator.clipboard?.writeText(secret)}>Copy secret</button></div>}{error && <div className="alert error">{error}</div>}<section className="panel form-panel"><PanelTitle title="Add endpoint" detail="HMAC-SHA256 signatures include a timestamp and delivery id." /><form onSubmit={create} className="inline-form"><input type="url" placeholder="https://hooks.example.com/registry" value={url} onChange={event => setUrl(event.target.value)} required /><button className="button primary">Add webhook</button></form></section><section className="panel"><PanelTitle title="Configured endpoints" />{webhooks.length ? <div className="list">{webhooks.map(webhook => <div className="list-row" key={webhook.id}><span className="repo-icon">⌁</span><div><strong>{webhook.url}</strong><small>{webhook.events.join(", ") || "all events"} · created {formatDate(webhook.created_at)}</small></div><span className={webhook.enabled ? "badge green" : "badge danger"}>{webhook.enabled ? "Active" : "Disabled"}</span>{webhook.enabled && <button className="text-button danger-text" onClick={() => disable(webhook.id)}>Disable</button>}</div>)}</div> : <EmptyState title="No webhooks yet" text="Add an endpoint to receive signed push and security events." />}</section></>;
+function useSessionUser(): User {
+  const [user, setUser] = useState<User>({ id: "", username: "", is_admin: false });
+  useEffect(() => {
+    api<User>("/api/v1/auth/me").then(setUser);
+  }, []);
+  return user;
 }
-
-function SecurityPage() { const [user, setUser] = useState<User | null>(null); useEffect(() => { api<User>("/api/v1/auth/me").then(setUser); }, []); return <><PageIntro eyebrow="ACCOUNT SECURITY" title="Security" description="Keep browser access and automation credentials separate, narrow, and easy to revoke." /><div className="two-col"><section className="panel"><PanelTitle title="Account" /><div className="security-card"><span className="avatar large">{user?.username.slice(0, 1).toUpperCase() ?? "?"}</span><div><strong>{user?.username}</strong><p className="muted">{user?.is_admin ? "Administrator" : "Member"}</p></div></div><div className="setting-row"><div><strong>Password</strong><small>Use a long unique password for your browser session.</small></div><button className="button quiet" disabled>Change</button></div><div className="setting-row"><div><strong>Two-factor authentication</strong><small>Authenticator-app support is reserved for the security story.</small></div><span className="badge">Not configured</span></div></section><section className="panel"><PanelTitle title="Session hygiene" /><div className="callout"><span className="callout-icon">✓</span><div><strong>Cookie session protection is on</strong><p>HttpOnly, SameSite=Strict cookies rotate on every login. Production mode adds Secure.</p></div></div><div className="callout"><span className="callout-icon">⌁</span><div><strong>Short-lived registry tokens</strong><p>Docker Bearer tokens expire quickly. Revoking a PAT stops new tokens immediately.</p></div></div></section></div></>; }
-
-function PageIntro({ eyebrow, title, description, action }: { eyebrow: string; title: string; description: string; action?: React.ReactNode }) { return <div className="page-intro"><div><p className="eyebrow">{eyebrow}</p><h1>{title}</h1><p className="intro-copy">{description}</p></div>{action}</div>; }
-function Metric({ label, value, detail, icon }: { label: string; value: string; detail: string; icon: string }) { return <div className="metric"><span className="metric-icon">{icon}</span><div><p>{label}</p><strong>{value}</strong><small>{detail}</small></div></div>; }
-function PanelTitle({ title, detail, action }: { title: string; detail?: string; action?: React.ReactNode }) { return <div className="panel-heading"><div><h2>{title}</h2>{detail && <p>{detail}</p>}</div>{action}</div>; }
-function Step({ number, title, text }: { number: string; title: string; text: string }) { return <div className="step"><span>{number}</span><div><strong>{title}</strong><p>{text}</p></div></div>; }
-function Loading() { return <div className="panel loading"><span className="spinner" /> Loading data…</div>; }
-function ErrorState({ message }: { message: string }) { return <div className="alert error">Could not load this view: {message}</div>; }
-function EmptyState({ title, text }: { title: string; text: string }) { return <div className="empty"><span className="empty-icon">◌</span><strong>{title}</strong><p>{text}</p></div>; }
-function formatBytes(value: number) { if (value < 1024) return `${value} B`; if (value < 1024 * 1024) return `${Math.round(value / 1024)} KB`; return `${(value / (1024 * 1024)).toFixed(1)} MB`; }

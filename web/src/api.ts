@@ -1,27 +1,98 @@
 export type User = { id: string; username: string; is_admin: boolean };
+export type Scope = { repository: string; actions: string[] };
 export type Token = {
   id: string;
   name: string;
   prefix: string;
-  scopes: { repository: string; actions: string[] }[];
+  scopes: Scope[];
   expires_at: number | null;
   last_used_at: number | null;
   revoked_at: number | null;
 };
-export type Overview = {
-  user: User;
-  repository_count: number;
-  repositories: string[];
-  active_token_count: number;
+export type Descriptor = { media_type: string; digest: string; size: number };
+export type Tag = {
+  tag: string;
+  digest: string;
+  media_type: string;
+  size: number;
+  created_at: number;
+  references?: Descriptor[];
+  subject?: Descriptor | null;
 };
-export type Repository = { name: string; visibility: string };
+export type Repository = {
+  name: string;
+  visibility: string;
+  tag_count?: number;
+  manifest_count?: number;
+  latest_tag?: string | null;
+  latest_digest?: string | null;
+  size?: number;
+  updated_at?: number | null;
+};
 export type RepositoryDetail = {
   name: string;
   visibility: string;
-  tags: { tag: string; digest: string; media_type: string; size: number; created_at: number }[];
+  tags: Tag[];
 };
-export type AuditEvent = { id: string; kind: string; occurred_at: number; actor: string | null; repository: string | null; tag: string | null; digest: string | null; metadata: Record<string, unknown> };
+export type AuditEvent = {
+  id: string;
+  kind: string;
+  occurred_at: number;
+  actor: string | null;
+  repository: string | null;
+  tag: string | null;
+  digest: string | null;
+  metadata: Record<string, unknown>;
+};
 export type Webhook = { id: string; url: string; events: string[]; enabled: boolean; created_at: number };
+export type Health = { status: string; storage: string; database: string };
+export type Overview = {
+  user: User;
+  repository_count: number;
+  repositories: Repository[];
+  storage_bytes: number;
+  referenced_bytes: number;
+  unreferenced_bytes: number;
+  active_token_count: number;
+  events: AuditEvent[];
+  health: Health;
+  uptime_seconds: number;
+};
+export type Instance = {
+  public_url: string;
+  registry_host: string;
+  environment: string;
+  storage_backend: string;
+  storage_bucket: string | null;
+  pull_mode: string;
+  token_service: string;
+  token_ttl_seconds: number;
+  registration: string;
+};
+export type StorageOverview = {
+  repository_count: number;
+  total_bytes: number;
+  referenced_bytes: number;
+  unreferenced_bytes: number;
+  repositories: Repository[];
+};
+export type UploadSession = {
+  id: string;
+  repository: string;
+  staging_key: string;
+  offset: number;
+  expires_at: number;
+  status: string;
+};
+export type GcReport = {
+  dry_run: boolean;
+  manifests: number;
+  blobs: number;
+  reclaimed_bytes: number;
+  failures: string[];
+};
+
+export type ApiError = Error & { status?: number; code?: string };
 
 export async function api<T>(path: string, init: RequestInit = {}): Promise<T> {
   const response = await fetch(path, {
@@ -29,16 +100,28 @@ export async function api<T>(path: string, init: RequestInit = {}): Promise<T> {
     ...init,
     headers: { ...(init.body ? { "Content-Type": "application/json" } : {}), ...(init.headers ?? {}) }
   });
+  if (response.status === 204) return undefined as T;
   const body = await response.json().catch(() => ({}));
   if (!response.ok) {
-    const error = new Error(body.error ?? "Request failed") as Error & { status?: number };
+    const error = new Error(typeof body.error === "string" ? body.error : "Request failed") as ApiError;
     error.status = response.status;
+    error.code = body.error;
     throw error;
   }
   return body as T;
 }
 
-export function formatDate(epoch: number | null | undefined): string {
-  if (!epoch) return "Never";
-  return new Date(epoch * 1000).toLocaleString(undefined, { dateStyle: "medium", timeStyle: "short" });
+export function friendlyError(error: unknown): string {
+  const apiError = error as ApiError;
+  if (apiError.status === 401) return "Your session expired. Sign in again to continue.";
+  if (apiError.status === 403) return "You don't have permission to access this page.";
+  if (apiError.status === 404) return "The requested resource was not found.";
+  if (apiError.status === 409) return "This change conflicts with the current registry state.";
+  if (apiError.status === 429) return "Too many requests. Wait a moment and retry.";
+  if (apiError.message === "unauthorized") return "The username or password is incorrect.";
+  if (apiError.message === "forbidden") return "You don't have permission to perform this action.";
+  if (apiError.message === "Failed to fetch" || apiError.name === "TypeError") {
+    return "The registry API did not respond.";
+  }
+  return apiError.message || "Something went wrong.";
 }

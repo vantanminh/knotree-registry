@@ -57,7 +57,7 @@ pub enum UploadStatusKind {
     Aborted,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize)]
 pub struct UploadStatus {
     pub id: Uuid,
     pub repository: RepositoryName,
@@ -138,6 +138,16 @@ impl UploadManager {
             version: 1,
             sessions,
         })
+    }
+
+    pub async fn list(&self) -> Vec<UploadStatus> {
+        let entries = self.sessions.read().await;
+        let mut sessions = Vec::with_capacity(entries.len());
+        for (id, entry) in entries.iter() {
+            sessions.push(status_for(*id, entry).await);
+        }
+        sessions.sort_by_key(|left| std::cmp::Reverse(left.expires_at));
+        sessions
     }
 
     pub async fn create(&self, repository: RepositoryName) -> UploadStatus {

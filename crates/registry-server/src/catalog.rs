@@ -61,6 +61,27 @@ pub struct GcReport {
     pub failures: Vec<String>,
 }
 
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct RepositorySummary {
+    pub name: String,
+    pub visibility: &'static str,
+    pub tag_count: usize,
+    pub manifest_count: usize,
+    pub latest_tag: Option<String>,
+    pub latest_digest: Option<String>,
+    pub size: u64,
+    pub updated_at: Option<u64>,
+}
+
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct StorageOverview {
+    pub repository_count: usize,
+    pub total_bytes: u64,
+    pub referenced_bytes: u64,
+    pub unreferenced_bytes: u64,
+    pub repositories: Vec<RepositorySummary>,
+}
+
 impl Catalog {
     pub fn from_snapshot(value: serde_json::Value) -> Result<Self, CatalogError> {
         let state = serde_json::from_value(value)?;
@@ -368,6 +389,97 @@ impl Catalog {
             .cloned()
             .collect()
     }
+
+    pub async fn inventory(&self) -> StorageOverview {
+        let state = self.state.read().await;
+        let mut live_manifests = BTreeSet::new();
+        for repository in state.repositories.values() {
+            live_manifests.extend(repository.tags.values().cloned());
+        }
+        let mut changed = true;
+        while changed {
+            changed = false;
+            let snapshot = live_manifests.clone();
+            for repository in state.repositories.values() {
+                for digest in &snapshot {
+                    if let Some(manifest) = repository.manifests.get(digest) {
+                        for descriptor in &manifest.references {
+                            if repository.manifests.contains_key(&descriptor.digest)
+                                && live_manifests.insert(descriptor.digest.clone())
+                            {
+                                changed = true;
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        let mut total_bytes: u64 = 0;
+        let mut referenced_bytes: u64 = 0;
+        let mut seen_blobs = BTreeSet::new();
+        let mut seen_live_blobs = BTreeSet::new();
+        let mut repositories = Vec::with_capacity(state.repositories.len());
+        for (name, record) in &state.repositories {
+            let mut size = 0u64;
+            let mut updated_at = None;
+            for manifest in record.manifests.values() {
+                size = size.saturating_add(manifest.size);
+                total_bytes = total_bytes.saturating_add(manifest.size);
+                if live_manifests.contains(&manifest.digest) {
+                    referenced_bytes = referenced_bytes.saturating_add(manifest.size);
+                }
+                if updated_at.is_none_or(|current| manifest.created_at > current) {
+                    updated_at = Some(manifest.created_at);
+                }
+                for descriptor in &manifest.references {
+                    if seen_blobs.insert(descriptor.digest.clone()) {
+                        total_bytes = total_bytes.saturating_add(descriptor.size);
+                    }
+                    if live_manifests.contains(&manifest.digest)
+                        && seen_live_blobs.insert(descriptor.digest.clone())
+                    {
+                        referenced_bytes = referenced_bytes.saturating_add(descriptor.size);
+                    }
+                    size = size.saturating_add(descriptor.size);
+                }
+            }
+            let mut latest_tag = None;
+            let mut latest_digest = None;
+            let mut latest_created = 0;
+            for (tag, digest) in &record.tags {
+                if let Some(manifest) = record.manifests.get(digest)
+                    && manifest.created_at >= latest_created
+                {
+                    latest_created = manifest.created_at;
+                    latest_tag = Some(tag.clone());
+                    latest_digest = Some(digest.to_string());
+                    updated_at = Some(
+                        updated_at
+                            .unwrap_or(manifest.created_at)
+                            .max(manifest.created_at),
+                    );
+                }
+            }
+            repositories.push(RepositorySummary {
+                name: name.clone(),
+                visibility: "private",
+                tag_count: record.tags.len(),
+                manifest_count: record.manifests.len(),
+                latest_tag,
+                latest_digest,
+                size,
+                updated_at,
+            });
+        }
+        repositories.sort_by_key(|left| std::cmp::Reverse(left.updated_at));
+        StorageOverview {
+            repository_count: repositories.len(),
+            total_bytes,
+            referenced_bytes,
+            unreferenced_bytes: total_bytes.saturating_sub(referenced_bytes),
+            repositories,
+        }
+    }
 }
 
 fn resolve_digest(repository: &RepositoryRecord, reference: &str) -> Result<Digest, CatalogError> {
@@ -435,6 +547,13 @@ mod tests {
             .publish_manifest(&repository, "latest", &live, None)
             .await
             .expect("live");
+        let inventory = catalog.inventory().await;
+        assert_eq!(inventory.repository_count, 1);
+        assert_eq!(
+            inventory.repositories[0].latest_tag.as_deref(),
+            Some("latest")
+        );
+        assert!(inventory.total_bytes >= live_record.size);
         let orphan_record = catalog
             .publish_manifest(
                 &repository,
