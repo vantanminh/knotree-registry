@@ -1,5 +1,7 @@
 //! Storage boundary used by registry protocol handlers.
 
+mod r2;
+
 use std::{
     path::{Component, Path, PathBuf},
     sync::Arc,
@@ -11,6 +13,8 @@ use sha2::{Digest as _, Sha256};
 use thiserror::Error;
 use tokio::{fs, io::AsyncWriteExt, sync::RwLock};
 use uuid::Uuid;
+
+pub use r2::R2ObjectStore;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ObjectMetadata {
@@ -25,6 +29,12 @@ pub enum StorageError {
     NotFound,
     #[error("invalid object key")]
     InvalidKey,
+    #[error("upload offset mismatch: expected {expected}, actual {actual}")]
+    OffsetMismatch { expected: u64, actual: u64 },
+    #[error("storage operation is not supported")]
+    Unsupported,
+    #[error("R2 storage operation failed: {0}")]
+    R2(String),
     #[error("storage I/O failed: {0}")]
     Io(#[from] std::io::Error),
 }
@@ -35,6 +45,16 @@ pub trait ObjectStore: Send + Sync {
     async fn get(&self, key: &str) -> Result<Bytes, StorageError>;
     async fn head(&self, key: &str) -> Result<ObjectMetadata, StorageError>;
     async fn delete(&self, key: &str) -> Result<(), StorageError>;
+    async fn append(
+        &self,
+        key: &str,
+        expected_offset: u64,
+        body: Bytes,
+    ) -> Result<u64, StorageError>;
+    async fn finalize_append(&self, key: &str) -> Result<(), StorageError> {
+        let _ = key;
+        Ok(())
+    }
     async fn health(&self) -> Result<(), StorageError>;
 }
 
@@ -132,6 +152,37 @@ impl ObjectStore for LocalFileStore {
         })
     }
 
+    async fn append(
+        &self,
+        key: &str,
+        expected_offset: u64,
+        body: Bytes,
+    ) -> Result<u64, StorageError> {
+        let path = self.path_for(key)?;
+        if let Some(parent) = path.parent() {
+            fs::create_dir_all(parent).await?;
+        }
+        let current = match fs::metadata(&path).await {
+            Ok(metadata) => metadata.len(),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => 0,
+            Err(error) => return Err(StorageError::Io(error)),
+        };
+        if current != expected_offset {
+            return Err(StorageError::OffsetMismatch {
+                expected: expected_offset,
+                actual: current,
+            });
+        }
+        let mut file = fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(path)
+            .await?;
+        file.write_all(&body).await?;
+        file.sync_data().await?;
+        Ok(current + body.len() as u64)
+    }
+
     async fn health(&self) -> Result<(), StorageError> {
         fs::metadata(&*self.root)
             .await
@@ -189,6 +240,31 @@ impl ObjectStore for MemoryObjectStore {
             .ok_or(StorageError::NotFound)
     }
 
+    async fn append(
+        &self,
+        key: &str,
+        expected_offset: u64,
+        body: Bytes,
+    ) -> Result<u64, StorageError> {
+        validate_key(key)?;
+        let mut objects = self.objects.write().await;
+        let current = objects.get(key).map_or(0, Bytes::len) as u64;
+        if current != expected_offset {
+            return Err(StorageError::OffsetMismatch {
+                expected: expected_offset,
+                actual: current,
+            });
+        }
+        let mut combined = Vec::with_capacity(current as usize + body.len());
+        if let Some(existing) = objects.get(key) {
+            combined.extend_from_slice(existing);
+        }
+        combined.extend_from_slice(&body);
+        let next = combined.len() as u64;
+        objects.insert(key.to_owned(), Bytes::from(combined));
+        Ok(next)
+    }
+
     async fn health(&self) -> Result<(), StorageError> {
         Ok(())
     }
@@ -213,6 +289,19 @@ mod tests {
         assert!(matches!(
             store.put("../escape", Bytes::new()).await,
             Err(StorageError::InvalidKey)
+        ));
+        assert_eq!(
+            store
+                .append("blobs/sha256/example", 5, Bytes::from_static(b" world"))
+                .await
+                .expect("append"),
+            11
+        );
+        assert!(matches!(
+            store
+                .append("blobs/sha256/example", 5, Bytes::from_static(b"!"))
+                .await,
+            Err(StorageError::OffsetMismatch { .. })
         ));
     }
 

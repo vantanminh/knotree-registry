@@ -398,6 +398,21 @@ impl AuthService {
             .ok_or(AuthError::InvalidCredentials)
     }
 
+    pub async fn verify_service_token(&self, token: &str) -> Result<UserSummary, AuthError> {
+        let claims = self
+            .issuer
+            .verify(token, &self.service)
+            .map_err(|_| AuthError::Bearer)?;
+        let user_id = Uuid::parse_str(&claims.sub).map_err(|_| AuthError::InvalidCredentials)?;
+        let state = self.state.read().await;
+        state
+            .users
+            .values()
+            .find(|user| user.id == user_id)
+            .map(summary)
+            .ok_or(AuthError::InvalidCredentials)
+    }
+
     async fn session_user_id(&self, session_token: &str) -> Result<Uuid, AuthError> {
         let now = now_seconds();
         let state = self.state.read().await;

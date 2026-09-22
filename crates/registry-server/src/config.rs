@@ -19,12 +19,18 @@ pub struct AppConfig {
     pub storage_backend: StorageBackend,
     pub storage_root: PathBuf,
     pub request_body_limit_bytes: usize,
+    pub upload_chunk_limit_bytes: usize,
     pub token_issuer: String,
     pub token_service: String,
     pub token_ttl_seconds: u64,
     pub bootstrap_admin_username: Option<String>,
     pub bootstrap_admin_password: Option<String>,
     pub cookie_secure: bool,
+    pub r2_endpoint: Option<String>,
+    pub r2_bucket: Option<String>,
+    pub r2_access_key_id: Option<String>,
+    pub r2_secret_access_key: Option<String>,
+    pub r2_region: String,
 }
 
 #[derive(Debug, Error)]
@@ -39,7 +45,9 @@ pub enum ConfigError {
     PublicUrl,
     #[error("DATABASE_URL is required when REQUIRE_DATABASE=true")]
     MissingDatabase,
-    #[error("R2 storage is not configured in this build; use STORAGE_BACKEND=local or memory")]
+    #[error(
+        "R2 storage requires R2_ENDPOINT, R2_BUCKET, R2_ACCESS_KEY_ID and R2_SECRET_ACCESS_KEY"
+    )]
     R2Unavailable,
     #[error("BOOTSTRAP_ADMIN_USERNAME and BOOTSTRAP_ADMIN_PASSWORD must be set together")]
     BootstrapCredentialsIncomplete,
@@ -70,6 +78,7 @@ impl AppConfig {
         let storage_root =
             PathBuf::from(env::var("STORAGE_ROOT").unwrap_or_else(|_| "./data/objects".to_owned()));
         let request_body_limit_bytes = parse_usize("REQUEST_BODY_LIMIT_BYTES", 4 * 1024 * 1024)?;
+        let upload_chunk_limit_bytes = parse_usize("UPLOAD_CHUNK_LIMIT_BYTES", 64 * 1024 * 1024)?;
         let token_issuer =
             env::var("TOKEN_ISSUER").unwrap_or_else(|_| "knotree-registry".to_owned());
         let token_service =
@@ -82,6 +91,19 @@ impl AppConfig {
             .ok()
             .filter(|value| !value.trim().is_empty());
         let cookie_secure = parse_bool("COOKIE_SECURE", true)?;
+        let r2_endpoint = env::var("R2_ENDPOINT")
+            .ok()
+            .filter(|value| !value.trim().is_empty());
+        let r2_bucket = env::var("R2_BUCKET")
+            .ok()
+            .filter(|value| !value.trim().is_empty());
+        let r2_access_key_id = env::var("R2_ACCESS_KEY_ID")
+            .ok()
+            .filter(|value| !value.trim().is_empty());
+        let r2_secret_access_key = env::var("R2_SECRET_ACCESS_KEY")
+            .ok()
+            .filter(|value| !value.trim().is_empty());
+        let r2_region = env::var("R2_REGION").unwrap_or_else(|_| "auto".to_owned());
         let config = Self {
             bind_addr,
             public_url,
@@ -91,12 +113,18 @@ impl AppConfig {
             storage_backend,
             storage_root,
             request_body_limit_bytes,
+            upload_chunk_limit_bytes,
             token_issuer,
             token_service,
             token_ttl_seconds,
             bootstrap_admin_username,
             bootstrap_admin_password,
             cookie_secure,
+            r2_endpoint,
+            r2_bucket,
+            r2_access_key_id,
+            r2_secret_access_key,
+            r2_region,
         };
         config.validate()?;
         Ok(config)
@@ -109,7 +137,12 @@ impl AppConfig {
         if self.require_database && self.database_url.is_none() {
             return Err(ConfigError::MissingDatabase);
         }
-        if self.storage_backend == StorageBackend::R2 {
+        if self.storage_backend == StorageBackend::R2
+            && (self.r2_endpoint.is_none()
+                || self.r2_bucket.is_none()
+                || self.r2_access_key_id.is_none()
+                || self.r2_secret_access_key.is_none())
+        {
             return Err(ConfigError::R2Unavailable);
         }
         if self.token_ttl_seconds < 60 || self.token_ttl_seconds > 3600 {

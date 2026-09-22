@@ -1,6 +1,7 @@
 use std::{fmt, str::FromStr};
 
 use serde::{Deserialize, Deserializer, Serialize, Serializer, de::Error as _};
+use sha2::{Digest as _, Sha256};
 use thiserror::Error;
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash, PartialOrd, Ord)]
@@ -35,6 +36,10 @@ impl Digest {
             return Err(DigestError::InvalidEncoding);
         }
         Ok(Self(value.to_owned()))
+    }
+
+    pub fn sha256(bytes: &[u8]) -> Self {
+        Self(format!("sha256:{}", hex::encode(Sha256::digest(bytes))))
     }
 
     pub fn algorithm(&self) -> &'static str {

@@ -1,10 +1,13 @@
-use std::{sync::Arc, time::Instant};
+use std::{
+    sync::Arc,
+    time::{Duration, Instant},
+};
 
 use registry_auth::AuthService;
 use registry_db::Database;
-use registry_storage::{DynObjectStore, LocalFileStore, MemoryObjectStore};
+use registry_storage::{DynObjectStore, LocalFileStore, MemoryObjectStore, R2ObjectStore};
 
-use crate::{AppConfig, AppError, StorageBackend};
+use crate::{AppConfig, AppError, Catalog, StorageBackend, UploadManager};
 
 #[derive(Clone)]
 pub struct AppState {
@@ -12,6 +15,8 @@ pub struct AppState {
     pub store: DynObjectStore,
     pub database: Option<Database>,
     pub auth: Arc<AuthService>,
+    pub catalog: Arc<Catalog>,
+    pub uploads: Arc<UploadManager>,
     pub started_at: Instant,
 }
 
@@ -27,7 +32,25 @@ impl AppState {
         let store: DynObjectStore = match config.storage_backend {
             StorageBackend::Local => Arc::new(LocalFileStore::new(&config.storage_root).await?),
             StorageBackend::Memory => Arc::new(MemoryObjectStore::default()),
-            StorageBackend::R2 => unreachable!("validated configuration cannot select R2"),
+            StorageBackend::R2 => Arc::new(
+                R2ObjectStore::new(
+                    config
+                        .r2_endpoint
+                        .as_deref()
+                        .expect("validated R2 endpoint"),
+                    config.r2_bucket.as_deref().expect("validated R2 bucket"),
+                    config
+                        .r2_access_key_id
+                        .as_deref()
+                        .expect("validated R2 access key"),
+                    config
+                        .r2_secret_access_key
+                        .as_deref()
+                        .expect("validated R2 secret key"),
+                    &config.r2_region,
+                )
+                .await?,
+            ),
         };
         let database = match config.database_url.as_deref() {
             Some(url) => {
@@ -53,11 +76,15 @@ impl AppState {
                 .await
                 .map_err(AppError::Auth)?;
         }
+        let catalog = Arc::new(Catalog::default());
+        let uploads = Arc::new(UploadManager::new(Duration::from_secs(24 * 60 * 60)));
         Ok(Self {
             config: Arc::new(config),
             store,
             database,
             auth,
+            catalog,
+            uploads,
             started_at: Instant::now(),
         })
     }

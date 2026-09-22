@@ -26,4 +26,4 @@ curl http://127.0.0.1:8080/v2/
 
 See [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md), [docs/decisions/DEC-001.md](docs/decisions/DEC-001.md), and the Harness story files for the implementation trace.
 
-Authentication details and the Docker token exchange are documented in [docs/product/AUTHENTICATION.md](docs/product/AUTHENTICATION.md). The OCI data-plane handlers are being added in the next implementation slice; the current `/v2/` route is only the foundation handshake.
+Authentication details and the Docker token exchange are documented in [docs/product/AUTHENTICATION.md](docs/product/AUTHENTICATION.md). The OCI data-plane contract and upload semantics are documented in [docs/product/OCI.md](docs/product/OCI.md).

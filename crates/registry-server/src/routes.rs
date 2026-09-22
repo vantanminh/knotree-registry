@@ -5,22 +5,26 @@ use axum::{
     body::Body,
     extract::{Path, Query, State},
     http::{
-        HeaderMap, HeaderValue, Request, StatusCode,
-        header::{AUTHORIZATION, COOKIE, SET_COOKIE},
+        HeaderMap, HeaderName, HeaderValue, Method, Request, StatusCode,
+        header::{
+            AUTHORIZATION, CONTENT_LENGTH, CONTENT_TYPE, COOKIE, ETAG, LINK, LOCATION, SET_COOKIE,
+            WWW_AUTHENTICATE,
+        },
     },
     middleware::{self, Next},
     response::{IntoResponse, Response},
-    routing::{get, post},
+    routing::{any, get, post},
 };
 use base64::{Engine as _, engine::general_purpose::STANDARD};
 use registry_auth::parse_scope;
-use registry_core::{Action, RepositoryName, RepositoryScope};
+use registry_core::{Action, Digest, RepositoryName, RepositoryScope};
 use serde::Deserialize;
 use serde_json::json;
 use tower_http::trace::TraceLayer;
 use uuid::Uuid;
 
 use crate::AppState;
+use crate::{UploadError, blob_key, manifest_key};
 
 pub fn router(state: AppState) -> Router {
     Router::new()
@@ -30,6 +34,7 @@ pub fn router(state: AppState) -> Router {
         .route("/health/live", get(livez))
         .route("/health/ready", get(readyz))
         .route("/v2/", get(distribution_version))
+        .route("/v2/{*path}", any(oci_route))
         .route("/auth/token", get(token))
         .route("/api/v1/auth/login", post(login))
         .route("/api/v1/auth/logout", post(logout))
@@ -78,8 +83,644 @@ async fn readyz(State(state): State<AppState>) -> impl IntoResponse {
     (status, Json(readiness))
 }
 
-async fn distribution_version() -> impl IntoResponse {
-    (StatusCode::OK, Json(json!({})))
+async fn distribution_version(State(state): State<AppState>, headers: HeaderMap) -> Response {
+    if let Some(token) = bearer_token(&headers)
+        && state.auth.verify_service_token(token).await.is_ok()
+    {
+        return version_response();
+    }
+    challenge_response(&state, None)
+}
+
+#[derive(Debug)]
+enum OciPath {
+    Manifest {
+        repository: RepositoryName,
+        reference: String,
+    },
+    Blob {
+        repository: RepositoryName,
+        digest: String,
+    },
+    Tags {
+        repository: RepositoryName,
+    },
+    UploadStart {
+        repository: RepositoryName,
+    },
+    Upload {
+        repository: RepositoryName,
+        id: Uuid,
+    },
+}
+
+async fn oci_route(State(state): State<AppState>, request: Request<Body>) -> Response {
+    if !matches!(
+        *request.method(),
+        Method::GET | Method::HEAD | Method::POST | Method::PATCH | Method::PUT | Method::DELETE
+    ) {
+        return oci_error(
+            StatusCode::METHOD_NOT_ALLOWED,
+            "UNSUPPORTED",
+            "method is not supported",
+        );
+    }
+    let path = request
+        .uri()
+        .path()
+        .strip_prefix("/v2/")
+        .unwrap_or_default();
+    let Some(parsed) = parse_oci_path(path) else {
+        return oci_error(
+            StatusCode::NOT_FOUND,
+            "NAME_UNKNOWN",
+            "resource was not found",
+        );
+    };
+    let (repository, action) = match &parsed {
+        OciPath::Manifest { repository, .. }
+        | OciPath::Blob { repository, .. }
+        | OciPath::Tags { repository } => (repository, Action::Pull),
+        OciPath::UploadStart { repository } | OciPath::Upload { repository, .. } => {
+            (repository, Action::Push)
+        }
+    };
+    let Some(token) = bearer_token(request.headers()).map(str::to_owned) else {
+        return challenge_response(&state, Some(repository));
+    };
+    match state.auth.verify_bearer(&token, repository, action).await {
+        Ok(_) => {}
+        Err(registry_auth::AuthError::NoAccess) => {
+            return oci_error(
+                StatusCode::FORBIDDEN,
+                "DENIED",
+                "requested action is not authorized",
+            );
+        }
+        Err(_) => return challenge_response(&state, Some(repository)),
+    }
+    let head = request.method() == Method::HEAD;
+    match parsed {
+        OciPath::Manifest {
+            repository,
+            reference,
+        } => manifest_response(&state, &repository, &reference, head).await,
+        OciPath::Blob { repository, digest } => {
+            blob_response(&state, &repository, &digest, head).await
+        }
+        OciPath::Tags { repository } => {
+            tags_response(
+                &state,
+                &repository,
+                request.uri().query(),
+                request.method() == Method::HEAD,
+            )
+            .await
+        }
+        OciPath::UploadStart { repository } => {
+            upload_start(&state, repository, &token, request).await
+        }
+        OciPath::Upload { repository, id } => upload_session(&state, repository, id, request).await,
+    }
+}
+
+fn parse_oci_path(path: &str) -> Option<OciPath> {
+    if let Some(repository) = path.strip_suffix("/blobs/uploads/") {
+        return Some(OciPath::UploadStart {
+            repository: RepositoryName::parse(repository).ok()?,
+        });
+    }
+    if let Some((repository, id)) = path.rsplit_once("/blobs/uploads/") {
+        return Some(OciPath::Upload {
+            repository: RepositoryName::parse(repository).ok()?,
+            id: Uuid::parse_str(id).ok()?,
+        });
+    }
+    if let Some((repository, reference)) = path.rsplit_once("/manifests/") {
+        return Some(OciPath::Manifest {
+            repository: RepositoryName::parse(repository).ok()?,
+            reference: reference.to_owned(),
+        });
+    }
+    if let Some((repository, digest)) = path.rsplit_once("/blobs/") {
+        return Some(OciPath::Blob {
+            repository: RepositoryName::parse(repository).ok()?,
+            digest: digest.to_owned(),
+        });
+    }
+    if let Some(repository) = path.strip_suffix("/tags/list") {
+        return Some(OciPath::Tags {
+            repository: RepositoryName::parse(repository).ok()?,
+        });
+    }
+    None
+}
+
+async fn upload_start(
+    state: &AppState,
+    repository: RepositoryName,
+    token: &str,
+    request: Request<Body>,
+) -> Response {
+    let query = request.uri().query().unwrap_or_default();
+    if let Some(mount) = query_value(query, "mount")
+        && let Ok(digest) = Digest::parse(&mount)
+        && let Some(from) =
+            query_value(query, "from").and_then(|value| RepositoryName::parse(&value).ok())
+        && state
+            .auth
+            .verify_bearer(token, &from, Action::Pull)
+            .await
+            .is_ok()
+        && state.catalog.blob_visible(&from, &digest).await
+    {
+        state.catalog.attach_blob(&repository, digest.clone()).await;
+        let mut response = StatusCode::CREATED.into_response();
+        response.headers_mut().insert(
+            LOCATION,
+            HeaderValue::from_str(&format!("/v2/{repository}/blobs/{digest}"))
+                .expect("location is valid"),
+        );
+        response.headers_mut().insert(
+            HeaderName::from_static("docker-content-digest"),
+            HeaderValue::from_str(digest.as_str()).expect("digest is valid"),
+        );
+        add_protocol_headers(&mut response);
+        return response;
+    }
+    let session = state.uploads.create(repository.clone()).await;
+    if let Some(digest_value) = query_value(query, "digest") {
+        let digest = match Digest::parse(&digest_value) {
+            Ok(digest) => digest,
+            Err(_) => {
+                return oci_error(
+                    StatusCode::BAD_REQUEST,
+                    "DIGEST_INVALID",
+                    "digest is invalid",
+                );
+            }
+        };
+        let body = match to_body(request, state.config.upload_chunk_limit_bytes).await {
+            Ok(body) => body,
+            Err(response) => return response,
+        };
+        match state
+            .uploads
+            .finalize(session.id, digest, body, &state.store)
+            .await
+        {
+            Ok(finalized) => {
+                state
+                    .catalog
+                    .attach_blob(&finalized.repository, finalized.digest.clone())
+                    .await;
+                finalized_response(&finalized)
+            }
+            Err(error) => upload_error(error),
+        }
+    } else {
+        upload_progress_response(StatusCode::ACCEPTED, &session)
+    }
+}
+
+async fn upload_session(
+    state: &AppState,
+    repository: RepositoryName,
+    id: Uuid,
+    request: Request<Body>,
+) -> Response {
+    let status = match state.uploads.status(id).await {
+        Ok(status) if status.repository == repository => status,
+        Ok(_) => {
+            return oci_error(
+                StatusCode::NOT_FOUND,
+                "BLOB_UPLOAD_UNKNOWN",
+                "upload was not found",
+            );
+        }
+        Err(error) => return upload_error(error),
+    };
+    match *request.method() {
+        Method::GET | Method::HEAD => upload_progress_response(StatusCode::NO_CONTENT, &status),
+        Method::PATCH => {
+            let headers = request.headers().clone();
+            let body = match to_body(request, state.config.upload_chunk_limit_bytes).await {
+                Ok(body) => body,
+                Err(response) => return response,
+            };
+            let expected = match content_range_start(&headers, status.offset, body.len() as u64) {
+                Ok(expected) => expected,
+                Err(_) => {
+                    return upload_error(UploadError::OffsetMismatch {
+                        expected: status.offset,
+                        actual: status.offset.saturating_add(1),
+                    });
+                }
+            };
+            match state.uploads.append(id, expected, body, &state.store).await {
+                Ok(status) => upload_progress_response(StatusCode::ACCEPTED, &status),
+                Err(error) => upload_error(error),
+            }
+        }
+        Method::PUT => {
+            let digest = match query_value(request.uri().query().unwrap_or_default(), "digest")
+                .and_then(|value| Digest::parse(&value).ok())
+            {
+                Some(digest) => digest,
+                None => {
+                    return oci_error(
+                        StatusCode::BAD_REQUEST,
+                        "DIGEST_INVALID",
+                        "digest query parameter is required",
+                    );
+                }
+            };
+            let body = match to_body(request, state.config.upload_chunk_limit_bytes).await {
+                Ok(body) => body,
+                Err(response) => return response,
+            };
+            match state.uploads.finalize(id, digest, body, &state.store).await {
+                Ok(finalized) => {
+                    state
+                        .catalog
+                        .attach_blob(&finalized.repository, finalized.digest.clone())
+                        .await;
+                    finalized_response(&finalized)
+                }
+                Err(error) => upload_error(error),
+            }
+        }
+        Method::DELETE => match state.uploads.abort(id, &state.store).await {
+            Ok(()) => StatusCode::NO_CONTENT.into_response(),
+            Err(error) => upload_error(error),
+        },
+        _ => oci_error(
+            StatusCode::METHOD_NOT_ALLOWED,
+            "UNSUPPORTED",
+            "method is not supported",
+        ),
+    }
+}
+
+async fn to_body(request: Request<Body>, limit: usize) -> Result<bytes::Bytes, Response> {
+    axum::body::to_bytes(request.into_body(), limit)
+        .await
+        .map_err(|_| {
+            oci_error(
+                StatusCode::PAYLOAD_TOO_LARGE,
+                "BLOB_UPLOAD_INVALID",
+                "upload chunk is too large",
+            )
+        })
+}
+
+fn content_range_start(headers: &HeaderMap, default: u64, body_len: u64) -> Result<u64, ()> {
+    let Some(value) = headers.get("content-range") else {
+        return Ok(default);
+    };
+    let value = value.to_str().map_err(|_| ())?;
+    let value = value.strip_prefix("bytes ").unwrap_or(value);
+    let (start, end) = value.split_once('-').ok_or(())?;
+    let start = start.parse::<u64>().map_err(|_| ())?;
+    let end = end.parse::<u64>().map_err(|_| ())?;
+    if end < start || end - start + 1 != body_len {
+        return Err(());
+    }
+    Ok(start)
+}
+
+fn query_value(query: &str, key: &str) -> Option<String> {
+    url::form_urlencoded::parse(query.as_bytes())
+        .find(|(name, _)| name == key)
+        .map(|(_, value)| value.into_owned())
+}
+
+fn upload_progress_response(status_code: StatusCode, status: &crate::UploadStatus) -> Response {
+    let mut response = status_code.into_response();
+    response.headers_mut().insert(
+        LOCATION,
+        HeaderValue::from_str(&format!(
+            "/v2/{}/blobs/uploads/{}",
+            status.repository, status.id
+        ))
+        .expect("location is valid"),
+    );
+    response.headers_mut().insert(
+        HeaderName::from_static("docker-upload-uuid"),
+        HeaderValue::from_str(&status.id.to_string()).expect("uuid is valid"),
+    );
+    response.headers_mut().insert(
+        HeaderName::from_static("range"),
+        HeaderValue::from_str(&format!("bytes=0-{}", status.offset.saturating_sub(1)))
+            .expect("range is valid"),
+    );
+    add_protocol_headers(&mut response);
+    response
+}
+
+fn finalized_response(finalized: &crate::FinalizedUpload) -> Response {
+    let mut response = StatusCode::CREATED.into_response();
+    response.headers_mut().insert(
+        LOCATION,
+        HeaderValue::from_str(&format!(
+            "/v2/{}/blobs/{}",
+            finalized.repository, finalized.digest
+        ))
+        .expect("location is valid"),
+    );
+    response.headers_mut().insert(
+        HeaderName::from_static("docker-content-digest"),
+        HeaderValue::from_str(finalized.digest.as_str()).expect("digest is valid"),
+    );
+    response
+        .headers_mut()
+        .insert(CONTENT_LENGTH, HeaderValue::from_static("0"));
+    add_protocol_headers(&mut response);
+    response
+}
+
+fn upload_error(error: crate::UploadError) -> Response {
+    match error {
+        crate::UploadError::OffsetMismatch { .. } => oci_error(
+            StatusCode::RANGE_NOT_SATISFIABLE,
+            "RANGE_INVALID",
+            "upload range is not contiguous",
+        ),
+        crate::UploadError::DigestMismatch { .. } => oci_error(
+            StatusCode::BAD_REQUEST,
+            "DIGEST_INVALID",
+            "uploaded content digest does not match",
+        ),
+        crate::UploadError::NotFound | crate::UploadError::Expired => oci_error(
+            StatusCode::NOT_FOUND,
+            "BLOB_UPLOAD_UNKNOWN",
+            "upload was not found",
+        ),
+        crate::UploadError::InvalidState => oci_error(
+            StatusCode::CONFLICT,
+            "BLOB_UPLOAD_INVALID",
+            "upload is no longer active",
+        ),
+        crate::UploadError::Storage(_) => oci_error(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "UNKNOWN",
+            "storage failure",
+        ),
+    }
+}
+
+async fn manifest_response(
+    state: &AppState,
+    repository: &RepositoryName,
+    reference: &str,
+    head: bool,
+) -> Response {
+    let manifest = match state.catalog.resolve_manifest(repository, reference).await {
+        Ok(manifest) => manifest,
+        Err(_) => {
+            return oci_error(
+                StatusCode::NOT_FOUND,
+                "MANIFEST_UNKNOWN",
+                "manifest was not found",
+            );
+        }
+    };
+    let body = match state.store.get(&manifest_key(&manifest.digest)).await {
+        Ok(body) => body,
+        Err(registry_storage::StorageError::NotFound) => {
+            return oci_error(
+                StatusCode::NOT_FOUND,
+                "MANIFEST_UNKNOWN",
+                "manifest was not found",
+            );
+        }
+        Err(_) => {
+            return oci_error(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "UNKNOWN",
+                "storage failure",
+            );
+        }
+    };
+    content_response(
+        StatusCode::OK,
+        body,
+        head,
+        &manifest.media_type,
+        &manifest.digest,
+        None,
+        None,
+    )
+}
+
+async fn blob_response(
+    state: &AppState,
+    repository: &RepositoryName,
+    value: &str,
+    head: bool,
+) -> Response {
+    let digest = match Digest::parse(value) {
+        Ok(digest) => digest,
+        Err(_) => {
+            return oci_error(
+                StatusCode::BAD_REQUEST,
+                "DIGEST_INVALID",
+                "digest is invalid",
+            );
+        }
+    };
+    if !state.catalog.blob_visible(repository, &digest).await {
+        return oci_error(StatusCode::NOT_FOUND, "BLOB_UNKNOWN", "blob was not found");
+    }
+    let metadata = match state.store.head(&blob_key(&digest)).await {
+        Ok(metadata) => metadata,
+        Err(registry_storage::StorageError::NotFound) => {
+            return oci_error(StatusCode::NOT_FOUND, "BLOB_UNKNOWN", "blob was not found");
+        }
+        Err(_) => {
+            return oci_error(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "UNKNOWN",
+                "storage failure",
+            );
+        }
+    };
+    let body = if head {
+        bytes::Bytes::new()
+    } else {
+        match state.store.get(&blob_key(&digest)).await {
+            Ok(body) => body,
+            Err(_) => {
+                return oci_error(StatusCode::NOT_FOUND, "BLOB_UNKNOWN", "blob was not found");
+            }
+        }
+    };
+    content_response(
+        StatusCode::OK,
+        body,
+        head,
+        "application/octet-stream",
+        &digest,
+        Some(metadata.content_length),
+        Some(metadata.etag),
+    )
+}
+
+async fn tags_response(
+    state: &AppState,
+    repository: &RepositoryName,
+    query: Option<&str>,
+    head: bool,
+) -> Response {
+    let params = url::form_urlencoded::parse(query.unwrap_or_default().as_bytes())
+        .into_owned()
+        .collect::<std::collections::HashMap<_, _>>();
+    let limit = match params.get("n") {
+        Some(value) => match value.parse::<usize>() {
+            Ok(value) if (1..=1000).contains(&value) => value,
+            _ => {
+                return oci_error(
+                    StatusCode::BAD_REQUEST,
+                    "PAGINATION_NUMBER_INVALID",
+                    "n must be between 1 and 1000",
+                );
+            }
+        },
+        None => 100,
+    };
+    let last = params.get("last").map(String::as_str);
+    let (tags, next) = match state.catalog.list_tags(repository, last, limit).await {
+        Ok(result) => result,
+        Err(_) => {
+            return oci_error(
+                StatusCode::NOT_FOUND,
+                "NAME_UNKNOWN",
+                "repository was not found",
+            );
+        }
+    };
+    let body = serde_json::to_vec(&json!({"name": repository.as_str(), "tags": tags}))
+        .expect("tag response is serializable");
+    let content_length = body.len() as u64;
+    let mut response = content_response(
+        StatusCode::OK,
+        if head {
+            bytes::Bytes::new()
+        } else {
+            bytes::Bytes::from(body)
+        },
+        head,
+        "application/json",
+        &Digest::sha256(&[]),
+        Some(content_length),
+        None,
+    );
+    if let Some(next) = next {
+        let link = format!(
+            "</v2/{}/tags/list?n={}&last={}>; rel=\"next\"",
+            repository,
+            limit,
+            url::form_urlencoded::byte_serialize(next.as_bytes()).collect::<String>()
+        );
+        response.headers_mut().insert(
+            LINK,
+            HeaderValue::from_str(&link).expect("link header is valid"),
+        );
+    }
+    response.headers_mut().remove("docker-content-digest");
+    response
+}
+
+fn content_response(
+    status: StatusCode,
+    body: bytes::Bytes,
+    head: bool,
+    media_type: &str,
+    digest: &Digest,
+    content_length: Option<u64>,
+    etag: Option<String>,
+) -> Response {
+    let mut response = Response::new(if head {
+        Body::empty()
+    } else {
+        Body::from(body.clone())
+    });
+    *response.status_mut() = status;
+    let headers = response.headers_mut();
+    headers.insert(
+        CONTENT_TYPE,
+        HeaderValue::from_str(media_type).expect("media type is valid"),
+    );
+    headers.insert(
+        CONTENT_LENGTH,
+        HeaderValue::from_str(&content_length.unwrap_or(body.len() as u64).to_string())
+            .expect("length is valid"),
+    );
+    headers.insert(
+        HeaderName::from_static("docker-content-digest"),
+        HeaderValue::from_str(digest.as_str()).expect("digest is valid"),
+    );
+    if let Some(etag) = etag {
+        headers.insert(ETAG, HeaderValue::from_str(&etag).expect("etag is valid"));
+    }
+    add_protocol_headers(&mut response);
+    response
+}
+
+fn version_response() -> Response {
+    let mut response = (StatusCode::OK, Json(json!({}))).into_response();
+    add_protocol_headers(&mut response);
+    response
+}
+
+fn challenge_response(state: &AppState, repository: Option<&RepositoryName>) -> Response {
+    let realm = format!(
+        "{}/auth/token",
+        state.config.public_url.trim_end_matches('/')
+    );
+    let mut value = format!(
+        "Bearer realm=\"{realm}\",service=\"{}\"",
+        state.config.token_service
+    );
+    if let Some(repository) = repository {
+        value.push_str(&format!(",scope=\"repository:{repository}:pull\""));
+    }
+    let mut response = (
+        StatusCode::UNAUTHORIZED,
+        Json(json!({"errors":[{"code":"UNAUTHORIZED","message":"authentication required"}]})),
+    )
+        .into_response();
+    response.headers_mut().insert(
+        WWW_AUTHENTICATE,
+        HeaderValue::from_str(&value).expect("challenge is valid"),
+    );
+    add_protocol_headers(&mut response);
+    response
+}
+
+fn oci_error(status: StatusCode, code: &str, message: &str) -> Response {
+    let mut response = (
+        status,
+        Json(json!({"errors":[{"code":code,"message":message}]})),
+    )
+        .into_response();
+    add_protocol_headers(&mut response);
+    response
+}
+
+fn add_protocol_headers(response: &mut Response) {
+    response.headers_mut().insert(
+        HeaderName::from_static("docker-distribution-api-version"),
+        HeaderValue::from_static("registry/2.0"),
+    );
+}
+
+fn bearer_token(headers: &HeaderMap) -> Option<&str> {
+    headers
+        .get(AUTHORIZATION)?
+        .to_str()
+        .ok()?
+        .strip_prefix("Bearer ")
 }
 
 #[derive(Debug, Deserialize)]
@@ -272,9 +913,12 @@ fn expired_session_cookie(state: &AppState) -> HeaderValue {
 #[cfg(test)]
 mod tests {
     use axum::{
-        body::Body,
+        body::{Body, to_bytes},
         http::{Request, StatusCode},
     };
+    use bytes::Bytes;
+    use registry_auth::parse_scope;
+    use registry_core::{Digest, RepositoryName};
     use tower::util::ServiceExt;
 
     use super::*;
@@ -290,12 +934,18 @@ mod tests {
             storage_backend: StorageBackend::Memory,
             storage_root: std::env::temp_dir(),
             request_body_limit_bytes: 1024,
+            upload_chunk_limit_bytes: 1024 * 1024,
             token_issuer: "knotree-registry".to_owned(),
             token_service: "knotree-registry".to_owned(),
             token_ttl_seconds: 300,
             bootstrap_admin_username: None,
             bootstrap_admin_password: None,
             cookie_secure: false,
+            r2_endpoint: None,
+            r2_bucket: None,
+            r2_access_key_id: None,
+            r2_secret_access_key: None,
+            r2_region: "auto".to_owned(),
         }
     }
 
@@ -311,7 +961,8 @@ mod tests {
             )
             .await
             .expect("response");
-        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+        assert!(response.headers().contains_key("www-authenticate"));
         let response = router(AppState::initialize(test_config()).await.expect("state"))
             .oneshot(
                 Request::builder()
@@ -323,5 +974,188 @@ mod tests {
             .expect("response");
         assert_eq!(response.status(), StatusCode::OK);
         assert!(response.headers().contains_key("x-request-id"));
+    }
+
+    #[tokio::test]
+    async fn authorized_pull_preserves_manifest_bytes_and_headers() {
+        let state = AppState::initialize(test_config()).await.expect("state");
+        let user = state
+            .auth
+            .bootstrap_admin("admin", "correct horse battery staple")
+            .await
+            .expect("bootstrap");
+        let credential = state
+            .auth
+            .issue_credential_for_user(
+                user.id,
+                "pull".to_owned(),
+                vec![parse_scope("repository:team/app:pull").expect("scope")],
+                None,
+            )
+            .await
+            .expect("credential");
+        let bearer = state
+            .auth
+            .mint_token(
+                "admin",
+                &credential.secret,
+                "knotree-registry",
+                &[parse_scope("repository:team/app:pull").expect("scope")],
+            )
+            .await
+            .expect("bearer")
+            .token;
+        let repository = RepositoryName::parse("team/app").expect("repository");
+        let raw = Bytes::from_static(
+            br#"{"schemaVersion":2,"mediaType":"application/vnd.oci.image.manifest.v1+json","config":{"mediaType":"application/vnd.oci.image.config.v1+json","digest":"sha256:0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef","size":0},"layers":[]}"#,
+        );
+        let manifest = state
+            .catalog
+            .publish_manifest(&repository, "latest", &raw, None)
+            .await
+            .expect("manifest");
+        state
+            .store
+            .put(&manifest_key(&manifest.digest), raw.clone())
+            .await
+            .expect("manifest object");
+
+        let response = router(state.clone())
+            .oneshot(
+                Request::builder()
+                    .uri("/v2/team/app/manifests/latest")
+                    .header("authorization", format!("Bearer {bearer}"))
+                    .body(Body::empty())
+                    .expect("request"),
+            )
+            .await
+            .expect("response");
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(
+            response.headers()["docker-content-digest"],
+            manifest.digest.as_str()
+        );
+        assert_eq!(
+            response.headers()["content-type"],
+            "application/vnd.oci.image.manifest.v1+json"
+        );
+        assert_eq!(
+            to_bytes(response.into_body(), usize::MAX)
+                .await
+                .expect("body"),
+            raw
+        );
+
+        let response = router(state)
+            .oneshot(
+                Request::builder()
+                    .method("HEAD")
+                    .uri("/v2/team/app/manifests/latest")
+                    .header("authorization", format!("Bearer {bearer}"))
+                    .body(Body::empty())
+                    .expect("request"),
+            )
+            .await
+            .expect("response");
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(response.headers()["content-length"], raw.len().to_string());
+        assert!(
+            to_bytes(response.into_body(), usize::MAX)
+                .await
+                .expect("body")
+                .is_empty()
+        );
+        assert_eq!(Digest::sha256(&raw), manifest.digest);
+    }
+
+    #[tokio::test]
+    async fn chunked_upload_publishes_only_after_digest_verification() {
+        let state = AppState::initialize(test_config()).await.expect("state");
+        let user = state
+            .auth
+            .bootstrap_admin("admin", "correct horse battery staple")
+            .await
+            .expect("bootstrap");
+        let credential = state
+            .auth
+            .issue_credential_for_user(
+                user.id,
+                "push".to_owned(),
+                vec![parse_scope("repository:team/app:pull,push").expect("scope")],
+                None,
+            )
+            .await
+            .expect("credential");
+        let bearer = state
+            .auth
+            .mint_token(
+                "admin",
+                &credential.secret,
+                "knotree-registry",
+                &[parse_scope("repository:team/app:pull,push").expect("scope")],
+            )
+            .await
+            .expect("bearer")
+            .token;
+
+        let response = router(state.clone())
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/v2/team/app/blobs/uploads/")
+                    .header("authorization", format!("Bearer {bearer}"))
+                    .body(Body::empty())
+                    .expect("request"),
+            )
+            .await
+            .expect("response");
+        assert_eq!(response.status(), StatusCode::ACCEPTED);
+        let location = response.headers()["location"]
+            .to_str()
+            .expect("location")
+            .to_owned();
+
+        let response = router(state.clone())
+            .oneshot(
+                Request::builder()
+                    .method("PATCH")
+                    .uri(&location)
+                    .header("authorization", format!("Bearer {bearer}"))
+                    .header("content-range", "bytes 0-4")
+                    .body(Body::from("hello"))
+                    .expect("request"),
+            )
+            .await
+            .expect("response");
+        assert_eq!(response.status(), StatusCode::ACCEPTED);
+        assert_eq!(response.headers()["range"], "bytes=0-4");
+
+        let digest = Digest::sha256(b"hello");
+        let response = router(state.clone())
+            .oneshot(
+                Request::builder()
+                    .method("PUT")
+                    .uri(format!("{location}?digest={digest}"))
+                    .header("authorization", format!("Bearer {bearer}"))
+                    .body(Body::empty())
+                    .expect("request"),
+            )
+            .await
+            .expect("response");
+        assert_eq!(response.status(), StatusCode::CREATED);
+        assert_eq!(response.headers()["docker-content-digest"], digest.as_str());
+        assert_eq!(
+            state.store.get(&blob_key(&digest)).await.expect("blob"),
+            Bytes::from_static(b"hello")
+        );
+        assert!(
+            state
+                .catalog
+                .blob_visible(
+                    &RepositoryName::parse("team/app").expect("repository"),
+                    &digest
+                )
+                .await
+        );
     }
 }
