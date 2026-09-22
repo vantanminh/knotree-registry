@@ -246,7 +246,7 @@ function CreateTokenModal({
       <form id="create-token" className="stack" onSubmit={submit}>
         <label className="field">
           <span>Token name</span>
-          <input value={name} onChange={(event) => setName(event.target.value)} required placeholder="ci-production" />
+          <input value={name} onChange={(event) => setName(event.target.value)} required />
         </label>
         <label className="field">
           <span>Token type</span>
@@ -260,7 +260,7 @@ function CreateTokenModal({
         <label className="field">
           <span>Repository</span>
           <small>Use a repository name such as production/api. Wildcards are not accepted by the control plane.</small>
-          <input value={repository} onChange={(event) => setRepository(event.target.value)} required placeholder="production/api" />
+          <input value={repository} onChange={(event) => setRepository(event.target.value)} required placeholder="lowercase/name" />
         </label>
         <div className="perm">
           {["pull", "push", "delete", "admin"].map((action) => (

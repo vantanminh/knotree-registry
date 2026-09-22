@@ -167,7 +167,7 @@ export function RepositoriesPage({ host }: { host: string }) {
 function CreateRepositoryModal({ host, onClose }: { host: string; onClose: () => void }) {
   const [namespace, setNamespace] = useState("production");
   const [name, setName] = useState("");
-  const preview = `${namespace}/${name}`.replace(/\/+$/, "");
+  const preview = [namespace, name].filter(Boolean).join("/");
   const error = name ? validateRepositoryName(preview) : null;
   return (
     <Modal

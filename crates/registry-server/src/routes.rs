@@ -1269,10 +1269,14 @@ async fn instance(
     let session = cookie_value(&headers).ok_or(registry_auth::AuthError::InvalidSession)?;
     let _ = state.auth.session_user(session).await?;
     let public_url = url::Url::parse(&state.config.public_url).ok();
-    let host = public_url
-        .as_ref()
-        .and_then(|value| value.host_str())
-        .unwrap_or("registry.knotree.org");
+    let host = match public_url.as_ref() {
+        Some(url) => match (url.host_str(), url.port()) {
+            (Some(host), Some(port)) => format!("{host}:{port}"),
+            (Some(host), None) => host.to_owned(),
+            _ => "registry.knotree.org".to_owned(),
+        },
+        None => "registry.knotree.org".to_owned(),
+    };
     Ok(Json(json!({
         "public_url": state.config.public_url,
         "registry_host": host,
