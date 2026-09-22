@@ -12,6 +12,7 @@ harness.db-shm
 /data/
 /.env
 /deploy/.env
+/.runtime/
 
 # Frontend dependencies and build output
 /web/node_modules/

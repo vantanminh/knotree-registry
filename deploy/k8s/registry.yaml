@@ -1,0 +1,348 @@
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: knotree-registry
+  labels:
+    app.kubernetes.io/part-of: knotree-registry
+    app.kubernetes.io/managed-by: knotree-registry
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: postgres
+  namespace: knotree-registry
+  labels:
+    app.kubernetes.io/name: postgres
+    app.kubernetes.io/part-of: knotree-registry
+spec:
+  clusterIP: None
+  selector:
+    app.kubernetes.io/name: postgres
+    app.kubernetes.io/part-of: knotree-registry
+  ports:
+    - name: postgres
+      port: 5432
+      targetPort: postgres
+---
+apiVersion: apps/v1
+kind: StatefulSet
+metadata:
+  name: postgres
+  namespace: knotree-registry
+  labels:
+    app.kubernetes.io/name: postgres
+    app.kubernetes.io/part-of: knotree-registry
+spec:
+  serviceName: postgres
+  replicas: 1
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: postgres
+      app.kubernetes.io/part-of: knotree-registry
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: postgres
+        app.kubernetes.io/part-of: knotree-registry
+    spec:
+      terminationGracePeriodSeconds: 60
+      securityContext:
+        fsGroup: 999
+      containers:
+        - name: postgres
+          image: postgres:17-alpine
+          imagePullPolicy: IfNotPresent
+          ports:
+            - name: postgres
+              containerPort: 5432
+          env:
+            - name: POSTGRES_DB
+              value: registry
+            - name: POSTGRES_USER
+              value: registry
+            - name: POSTGRES_PASSWORD
+              valueFrom:
+                secretKeyRef:
+                  name: registry-postgres
+                  key: password
+          readinessProbe:
+            exec:
+              command:
+                - sh
+                - -ec
+                - pg_isready -U "$POSTGRES_USER" -d "$POSTGRES_DB"
+            initialDelaySeconds: 5
+            periodSeconds: 5
+            timeoutSeconds: 3
+            failureThreshold: 12
+          livenessProbe:
+            exec:
+              command:
+                - sh
+                - -ec
+                - pg_isready -U "$POSTGRES_USER" -d "$POSTGRES_DB"
+            initialDelaySeconds: 30
+            periodSeconds: 10
+            timeoutSeconds: 3
+            failureThreshold: 6
+          resources:
+            requests:
+              cpu: 50m
+              memory: 128Mi
+            limits:
+              cpu: 500m
+              memory: 512Mi
+          volumeMounts:
+            - name: data
+              mountPath: /var/lib/postgresql/data
+  volumeClaimTemplates:
+    - metadata:
+        name: data
+      spec:
+        accessModes:
+          - ReadWriteOnce
+        resources:
+          requests:
+            storage: 10Gi
+        storageClassName: local-path
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: registry-config
+  namespace: knotree-registry
+  labels:
+    app.kubernetes.io/name: registry
+    app.kubernetes.io/part-of: knotree-registry
+data:
+  STORAGE_BACKEND: local
+  R2_REGION: auto
+  PULL_MODE: proxy
+  DATABASE_MAX_CONNECTIONS: "5"
+  REQUEST_BODY_LIMIT_BYTES: "4194304"
+  UPLOAD_CHUNK_LIMIT_BYTES: "67108864"
+  REGISTRY_TOKEN_TTL_SECONDS: "300"
+---
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: registry-data
+  namespace: knotree-registry
+  labels:
+    app.kubernetes.io/name: registry
+    app.kubernetes.io/part-of: knotree-registry
+spec:
+  accessModes:
+    - ReadWriteOnce
+  resources:
+    requests:
+      storage: 20Gi
+  storageClassName: local-path
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: registry
+  namespace: knotree-registry
+  labels:
+    app.kubernetes.io/name: registry
+    app.kubernetes.io/part-of: knotree-registry
+spec:
+  selector:
+    app.kubernetes.io/name: registry
+    app.kubernetes.io/part-of: knotree-registry
+  ports:
+    - name: http
+      port: 80
+      targetPort: http
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: registry
+  namespace: knotree-registry
+  labels:
+    app.kubernetes.io/name: registry
+    app.kubernetes.io/part-of: knotree-registry
+spec:
+  replicas: 1
+  strategy:
+    type: Recreate
+  revisionHistoryLimit: 3
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: registry
+      app.kubernetes.io/part-of: knotree-registry
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: registry
+        app.kubernetes.io/part-of: knotree-registry
+    spec:
+      imagePullSecrets:
+        - name: registry-credentials
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 10001
+        runAsGroup: 10001
+        seccompProfile:
+          type: RuntimeDefault
+      terminationGracePeriodSeconds: 30
+      containers:
+        - name: registry
+          image: ghcr.io/vantanminh/knotree-registry:latest
+          imagePullPolicy: Always
+          ports:
+            - name: http
+              containerPort: 8080
+          env:
+            - name: APP_ENV
+              value: production
+            - name: BIND_ADDR
+              value: 0.0.0.0:8080
+            - name: PUBLIC_REGISTRY_URL
+              value: https://registry.knotree.com
+            - name: CONTROL_PLANE_ORIGINS
+              value: https://registry.knotree.com
+            - name: REQUIRE_DATABASE
+              value: "true"
+            - name: COOKIE_SECURE
+              value: "true"
+            - name: STATIC_ROOT
+              value: /opt/knotree-registry/web
+            - name: STORAGE_ROOT
+              value: /var/lib/knotree-registry/objects
+            - name: TOKEN_ISSUER
+              value: knotree-registry
+            - name: TOKEN_SERVICE
+              value: knotree-registry
+            - name: DATABASE_URL
+              valueFrom:
+                secretKeyRef:
+                  name: registry-app
+                  key: DATABASE_URL
+            - name: BOOTSTRAP_ADMIN_USERNAME
+              valueFrom:
+                secretKeyRef:
+                  name: registry-app
+                  key: BOOTSTRAP_ADMIN_USERNAME
+            - name: BOOTSTRAP_ADMIN_PASSWORD
+              valueFrom:
+                secretKeyRef:
+                  name: registry-app
+                  key: BOOTSTRAP_ADMIN_PASSWORD
+            - name: STORAGE_BACKEND
+              valueFrom:
+                configMapKeyRef:
+                  name: registry-config
+                  key: STORAGE_BACKEND
+            - name: DATABASE_MAX_CONNECTIONS
+              valueFrom:
+                configMapKeyRef:
+                  name: registry-config
+                  key: DATABASE_MAX_CONNECTIONS
+            - name: REQUEST_BODY_LIMIT_BYTES
+              valueFrom:
+                configMapKeyRef:
+                  name: registry-config
+                  key: REQUEST_BODY_LIMIT_BYTES
+            - name: UPLOAD_CHUNK_LIMIT_BYTES
+              valueFrom:
+                configMapKeyRef:
+                  name: registry-config
+                  key: UPLOAD_CHUNK_LIMIT_BYTES
+            - name: REGISTRY_TOKEN_TTL_SECONDS
+              valueFrom:
+                configMapKeyRef:
+                  name: registry-config
+                  key: REGISTRY_TOKEN_TTL_SECONDS
+            - name: R2_REGION
+              valueFrom:
+                configMapKeyRef:
+                  name: registry-config
+                  key: R2_REGION
+            - name: PULL_MODE
+              valueFrom:
+                configMapKeyRef:
+                  name: registry-config
+                  key: PULL_MODE
+            - name: R2_ENDPOINT
+              valueFrom:
+                secretKeyRef:
+                  name: registry-r2
+                  key: R2_ENDPOINT
+                  optional: true
+            - name: R2_BUCKET
+              valueFrom:
+                secretKeyRef:
+                  name: registry-r2
+                  key: R2_BUCKET
+                  optional: true
+            - name: R2_ACCESS_KEY_ID
+              valueFrom:
+                secretKeyRef:
+                  name: registry-r2
+                  key: R2_ACCESS_KEY_ID
+                  optional: true
+            - name: R2_SECRET_ACCESS_KEY
+              valueFrom:
+                secretKeyRef:
+                  name: registry-r2
+                  key: R2_SECRET_ACCESS_KEY
+                  optional: true
+            - name: EDGE_DOWNLOAD_URL
+              valueFrom:
+                secretKeyRef:
+                  name: registry-edge
+                  key: EDGE_DOWNLOAD_URL
+                  optional: true
+            - name: EDGE_DOWNLOAD_SECRET
+              valueFrom:
+                secretKeyRef:
+                  name: registry-edge
+                  key: EDGE_DOWNLOAD_SECRET
+                  optional: true
+            - name: RUST_LOG
+              value: registry_server=info,tower_http=info
+          readinessProbe:
+            httpGet:
+              path: /readyz
+              port: http
+            initialDelaySeconds: 10
+            periodSeconds: 10
+            timeoutSeconds: 5
+            failureThreshold: 12
+          livenessProbe:
+            httpGet:
+              path: /livez
+              port: http
+            initialDelaySeconds: 20
+            periodSeconds: 15
+            timeoutSeconds: 5
+            failureThreshold: 5
+          resources:
+            requests:
+              cpu: 100m
+              memory: 256Mi
+            limits:
+              cpu: 750m
+              memory: 768Mi
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities:
+              drop:
+                - ALL
+          volumeMounts:
+            - name: registry-data
+              mountPath: /var/lib/knotree-registry
+            - name: tmp
+              mountPath: /tmp
+      volumes:
+        - name: registry-data
+          persistentVolumeClaim:
+            claimName: registry-data
+        - name: tmp
+          emptyDir:
+            medium: Memory
+            sizeLimit: 64Mi
