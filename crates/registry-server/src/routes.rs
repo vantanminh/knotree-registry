@@ -1,4 +1,7 @@
-use std::collections::BTreeSet;
+use std::{
+    collections::BTreeSet,
+    time::{SystemTime, UNIX_EPOCH},
+};
 
 use axum::{
     Json, Router,
@@ -16,14 +19,16 @@ use axum::{
     routing::{any, get, post},
 };
 use base64::{Engine as _, engine::general_purpose::STANDARD};
+use hmac::{Hmac, Mac};
 use registry_auth::parse_scope;
 use registry_core::{Action, Digest, OCI_IMAGE_INDEX, RepositoryName, RepositoryScope};
 use serde::Deserialize;
 use serde_json::json;
+use sha2::Sha256;
 use tower_http::trace::TraceLayer;
 use uuid::Uuid;
 
-use crate::AppState;
+use crate::{AppState, PullMode};
 use crate::{UploadError, blob_key, manifest_key};
 
 pub fn router(state: AppState) -> Router {
@@ -504,6 +509,10 @@ fn query_value(query: &str, key: &str) -> Option<String> {
         .map(|(_, value)| value.into_owned())
 }
 
+fn query_escape(value: &str) -> String {
+    url::form_urlencoded::byte_serialize(value.as_bytes()).collect()
+}
+
 fn upload_progress_response(status_code: StatusCode, status: &crate::UploadStatus) -> Response {
     let mut response = status_code.into_response();
     response.headers_mut().insert(
@@ -641,6 +650,9 @@ async fn blob_response(
     if !state.catalog.blob_visible(repository, &digest).await {
         return oci_error(StatusCode::NOT_FOUND, "BLOB_UNKNOWN", "blob was not found");
     }
+    if state.config.pull_mode == PullMode::Edge {
+        return edge_blob_redirect(state, &digest);
+    }
     let metadata = match state.store.head(&blob_key(&digest)).await {
         Ok(metadata) => metadata,
         Err(registry_storage::StorageError::NotFound) => {
@@ -673,6 +685,59 @@ async fn blob_response(
         Some(metadata.content_length),
         Some(metadata.etag),
     )
+}
+
+fn edge_blob_redirect(state: &AppState, digest: &Digest) -> Response {
+    let Some(base_url) = state.config.edge_download_url.as_deref() else {
+        return oci_error(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "BLOB_UNKNOWN",
+            "edge pull mode is not configured",
+        );
+    };
+    let Some(secret) = state.config.edge_download_secret.as_deref() else {
+        return oci_error(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "BLOB_UNKNOWN",
+            "edge pull mode is not configured",
+        );
+    };
+    let expires_at = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs()
+        .saturating_add(60);
+    let key = blob_key(digest);
+    let canonical = format!("BLOB\n{key}\n{digest}\n{expires_at}");
+    let Ok(mut signer) = Hmac::<Sha256>::new_from_slice(secret.as_bytes()) else {
+        return oci_error(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "UNKNOWN",
+            "edge grant signer is invalid",
+        );
+    };
+    signer.update(canonical.as_bytes());
+    let signature = hex::encode(signer.finalize().into_bytes());
+    let separator = if base_url.contains('?') { '&' } else { '?' };
+    let location = format!(
+        "{base_url}{separator}key={}&digest={}&exp={expires_at}&sig={signature}",
+        query_escape(&key),
+        query_escape(digest.as_str()),
+    );
+    let mut response = StatusCode::TEMPORARY_REDIRECT.into_response();
+    response.headers_mut().insert(
+        LOCATION,
+        HeaderValue::from_str(&location).expect("edge location is valid"),
+    );
+    response.headers_mut().insert(
+        HeaderName::from_static("docker-content-digest"),
+        HeaderValue::from_str(digest.as_str()).expect("digest is valid"),
+    );
+    response
+        .headers_mut()
+        .insert("cache-control", HeaderValue::from_static("no-store"));
+    add_protocol_headers(&mut response);
+    response
 }
 
 async fn tags_response(
@@ -1148,6 +1213,9 @@ mod tests {
             r2_access_key_id: None,
             r2_secret_access_key: None,
             r2_region: "auto".to_owned(),
+            pull_mode: PullMode::Proxy,
+            edge_download_url: None,
+            edge_download_secret: None,
         }
     }
 
@@ -1276,6 +1344,63 @@ mod tests {
             .await
             .expect("response");
         assert_eq!(response.status(), StatusCode::NO_CONTENT);
+    }
+
+    #[tokio::test]
+    async fn edge_pull_redirect_is_signed_after_repository_authorization() {
+        let mut config = test_config();
+        config.pull_mode = PullMode::Edge;
+        config.edge_download_url = Some("https://blobs.example.com/v1/blob".to_owned());
+        config.edge_download_secret = Some("edge-secret".to_owned());
+        let state = AppState::initialize(config).await.expect("state");
+        let user = state
+            .auth
+            .bootstrap_admin("admin", "correct horse battery staple")
+            .await
+            .expect("bootstrap");
+        let credential = state
+            .auth
+            .issue_credential_for_user(
+                user.id,
+                "pull".to_owned(),
+                vec![parse_scope("repository:team/app:pull").expect("scope")],
+                None,
+            )
+            .await
+            .expect("credential");
+        let bearer = state
+            .auth
+            .mint_token(
+                "admin",
+                &credential.secret,
+                "knotree-registry",
+                &[parse_scope("repository:team/app:pull").expect("scope")],
+            )
+            .await
+            .expect("bearer")
+            .token;
+        let repository = RepositoryName::parse("team/app").expect("repository");
+        let digest = Digest::sha256(b"edge blob");
+        state.catalog.attach_blob(&repository, digest.clone()).await;
+
+        let response = router(state)
+            .oneshot(
+                Request::builder()
+                    .uri(format!("/v2/team/app/blobs/{digest}"))
+                    .header("authorization", format!("Bearer {bearer}"))
+                    .body(Body::empty())
+                    .expect("request"),
+            )
+            .await
+            .expect("response");
+        assert_eq!(response.status(), StatusCode::TEMPORARY_REDIRECT);
+        assert!(
+            response.headers()["location"]
+                .to_str()
+                .expect("location")
+                .contains("sig=")
+        );
+        assert_eq!(response.headers()["docker-content-digest"], digest.as_str());
     }
 
     #[tokio::test]

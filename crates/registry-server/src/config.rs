@@ -9,6 +9,12 @@ pub enum StorageBackend {
     R2,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PullMode {
+    Proxy,
+    Edge,
+}
+
 #[derive(Debug, Clone)]
 pub struct AppConfig {
     pub bind_addr: SocketAddr,
@@ -31,6 +37,9 @@ pub struct AppConfig {
     pub r2_access_key_id: Option<String>,
     pub r2_secret_access_key: Option<String>,
     pub r2_region: String,
+    pub pull_mode: PullMode,
+    pub edge_download_url: Option<String>,
+    pub edge_download_secret: Option<String>,
 }
 
 #[derive(Debug, Error)]
@@ -49,6 +58,10 @@ pub enum ConfigError {
         "R2 storage requires R2_ENDPOINT, R2_BUCKET, R2_ACCESS_KEY_ID and R2_SECRET_ACCESS_KEY"
     )]
     R2Unavailable,
+    #[error("PULL_MODE must be 'proxy' or 'edge'")]
+    PullMode(String),
+    #[error("edge pull mode requires EDGE_DOWNLOAD_URL and EDGE_DOWNLOAD_SECRET")]
+    EdgeUnavailable,
     #[error("BOOTSTRAP_ADMIN_USERNAME and BOOTSTRAP_ADMIN_PASSWORD must be set together")]
     BootstrapCredentialsIncomplete,
 }
@@ -104,6 +117,21 @@ impl AppConfig {
             .ok()
             .filter(|value| !value.trim().is_empty());
         let r2_region = env::var("R2_REGION").unwrap_or_else(|_| "auto".to_owned());
+        let pull_mode = match env::var("PULL_MODE")
+            .unwrap_or_else(|_| "proxy".to_owned())
+            .to_ascii_lowercase()
+            .as_str()
+        {
+            "proxy" => PullMode::Proxy,
+            "edge" => PullMode::Edge,
+            value => return Err(ConfigError::PullMode(value.to_owned())),
+        };
+        let edge_download_url = env::var("EDGE_DOWNLOAD_URL")
+            .ok()
+            .filter(|value| !value.trim().is_empty());
+        let edge_download_secret = env::var("EDGE_DOWNLOAD_SECRET")
+            .ok()
+            .filter(|value| !value.trim().is_empty());
         let config = Self {
             bind_addr,
             public_url,
@@ -125,6 +153,9 @@ impl AppConfig {
             r2_access_key_id,
             r2_secret_access_key,
             r2_region,
+            pull_mode,
+            edge_download_url,
+            edge_download_secret,
         };
         config.validate()?;
         Ok(config)
@@ -144,6 +175,11 @@ impl AppConfig {
                 || self.r2_secret_access_key.is_none())
         {
             return Err(ConfigError::R2Unavailable);
+        }
+        if self.pull_mode == PullMode::Edge
+            && (self.edge_download_url.is_none() || self.edge_download_secret.is_none())
+        {
+            return Err(ConfigError::EdgeUnavailable);
         }
         if self.token_ttl_seconds < 60 || self.token_ttl_seconds > 3600 {
             return Err(ConfigError::Number(

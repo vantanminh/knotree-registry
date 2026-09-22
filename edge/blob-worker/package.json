@@ -1,0 +1,16 @@
+{
+  "name": "knotree-registry-blob-worker",
+  "private": true,
+  "version": "0.1.0",
+  "type": "module",
+  "scripts": {
+    "generate-types": "wrangler types",
+    "typecheck": "tsc --noEmit",
+    "test": "vitest run"
+  },
+  "devDependencies": {
+    "typescript": "^5.9.2",
+    "vitest": "^5.0.1",
+    "wrangler": "^4.136.1"
+  }
+}
