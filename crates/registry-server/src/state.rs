@@ -5,6 +5,7 @@ use std::{
 
 use registry_auth::AuthService;
 use registry_db::Database;
+use registry_events::{EventLog, WebhookRegistry};
 use registry_storage::{DynObjectStore, LocalFileStore, MemoryObjectStore, R2ObjectStore};
 
 use crate::{AppConfig, AppError, Catalog, StorageBackend, UploadManager};
@@ -17,6 +18,8 @@ pub struct AppState {
     pub auth: Arc<AuthService>,
     pub catalog: Arc<Catalog>,
     pub uploads: Arc<UploadManager>,
+    pub events: EventLog,
+    pub webhooks: WebhookRegistry,
     pub started_at: Instant,
 }
 
@@ -85,6 +88,8 @@ impl AppState {
             auth,
             catalog,
             uploads,
+            events: EventLog::default(),
+            webhooks: WebhookRegistry::default(),
             started_at: Instant::now(),
         })
     }

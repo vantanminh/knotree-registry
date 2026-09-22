@@ -2126,6 +2126,17 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "d6f6ff9a378485b298a5286656da665ba74413d36db0979633275d2e708145d4"
 
 [[package]]
+name = "registry-agent"
+version = "0.1.0"
+dependencies = [
+ "async-trait",
+ "registry-core",
+ "serde",
+ "thiserror",
+ "tokio",
+]
+
+[[package]]
 name = "registry-auth"
 version = "0.1.0"
 dependencies = [
@@ -2163,6 +2174,21 @@ dependencies = [
 ]
 
 [[package]]
+name = "registry-events"
+version = "0.1.0"
+dependencies = [
+ "hex",
+ "hmac 0.12.1",
+ "serde",
+ "serde_json",
+ "sha2 0.10.9",
+ "subtle",
+ "thiserror",
+ "tokio",
+ "uuid",
+]
+
+[[package]]
 name = "registry-server"
 version = "0.1.0"
 dependencies = [
@@ -2177,6 +2203,7 @@ dependencies = [
  "registry-auth",
  "registry-core",
  "registry-db",
+ "registry-events",
  "registry-storage",
  "serde",
  "serde_json",

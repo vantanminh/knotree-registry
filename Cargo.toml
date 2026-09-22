@@ -3,6 +3,8 @@ members = [
     "crates/registry-auth",
     "crates/registry-core",
     "crates/registry-db",
+    "crates/registry-events",
+    "crates/registry-agent",
     "crates/registry-server",
     "crates/registry-storage",
 ]

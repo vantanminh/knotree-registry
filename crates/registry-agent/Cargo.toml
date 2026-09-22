@@ -1,0 +1,12 @@
+[package]
+name = "registry-agent"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+async-trait.workspace = true
+registry-core = { path = "../registry-core" }
+serde.workspace = true
+thiserror.workspace = true
+tokio.workspace = true

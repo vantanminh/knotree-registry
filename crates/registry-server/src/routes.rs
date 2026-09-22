@@ -24,6 +24,7 @@ use registry_auth::parse_scope;
 use registry_core::{
     Action, Digest, OCI_IMAGE_INDEX, RepositoryName, RepositoryScope, validate_manifest,
 };
+use registry_events::{EventKind, RegistryEvent};
 use serde::Deserialize;
 use serde_json::json;
 use sha2::Sha256;
@@ -51,6 +52,9 @@ pub fn router(state: AppState) -> Router {
         .route("/api/v1/overview", get(overview))
         .route("/api/v1/repositories", get(list_repositories))
         .route("/api/v1/repositories/{*repository}", get(repository_detail))
+        .route("/api/v1/audit", get(list_audit))
+        .route("/api/v1/webhooks", get(list_webhooks).post(create_webhook))
+        .route("/api/v1/webhooks/{id}/disable", post(disable_webhook))
         .route("/api/v1/admin/gc", post(run_gc))
         .with_state(state)
         .layer(middleware::from_fn(request_id))
@@ -301,6 +305,13 @@ async fn put_manifest_response(
             );
         }
     };
+    let mut event = RegistryEvent::new(EventKind::ManifestPushed);
+    event.repository = Some(repository.to_string());
+    event.digest = Some(manifest.digest.to_string());
+    if Digest::parse(reference).is_err() {
+        event.tag = Some(reference.to_owned());
+    }
+    state.events.record(event).await;
     let mut response = StatusCode::CREATED.into_response();
     response.headers_mut().insert(
         LOCATION,
@@ -363,6 +374,13 @@ async fn delete_manifest_response(
 ) -> Response {
     match state.catalog.delete_manifest(repository, reference).await {
         Ok(manifest) => {
+            let mut event = RegistryEvent::new(EventKind::ManifestDeleted);
+            event.repository = Some(repository.to_string());
+            event.digest = Some(manifest.digest.to_string());
+            if Digest::parse(reference).is_err() {
+                event.tag = Some(reference.to_owned());
+            }
+            state.events.record(event).await;
             let mut response = StatusCode::ACCEPTED.into_response();
             response.headers_mut().insert(
                 HeaderName::from_static("docker-content-digest"),
@@ -1050,6 +1068,9 @@ async fn login(
     Json(input): Json<LoginRequest>,
 ) -> Result<Response, crate::AppError> {
     let session = state.auth.login(&input.username, &input.password).await?;
+    let mut event = RegistryEvent::new(EventKind::LoginSucceeded);
+    event.actor = Some(input.username.clone());
+    state.events.record(event).await;
     let mut response =
         Json(json!({"user": session.user, "expires_at": session.expires_at})).into_response();
     response.headers_mut().insert(
@@ -1140,6 +1161,80 @@ async fn repository_detail(
 }
 
 #[derive(Debug, Deserialize)]
+struct AuditQuery {
+    limit: Option<usize>,
+}
+
+async fn list_audit(
+    State(state): State<AppState>,
+    Query(query): Query<AuditQuery>,
+    headers: HeaderMap,
+) -> Result<impl IntoResponse, crate::AppError> {
+    let session = cookie_value(&headers).ok_or(registry_auth::AuthError::InvalidSession)?;
+    let _ = state.auth.session_user(session).await?;
+    let limit = query.limit.unwrap_or(50).clamp(1, 200);
+    Ok(Json(json!({"events": state.events.recent(limit).await})))
+}
+
+#[derive(Debug, Deserialize)]
+struct CreateWebhookRequest {
+    url: String,
+    #[serde(default)]
+    events: BTreeSet<EventKind>,
+}
+
+async fn list_webhooks(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+) -> Result<impl IntoResponse, crate::AppError> {
+    let session = cookie_value(&headers).ok_or(registry_auth::AuthError::InvalidSession)?;
+    let _ = state.auth.session_user(session).await?;
+    Ok(Json(json!({"webhooks": state.webhooks.list().await})))
+}
+
+async fn create_webhook(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Json(input): Json<CreateWebhookRequest>,
+) -> Result<impl IntoResponse, crate::AppError> {
+    let session = cookie_value(&headers).ok_or(registry_auth::AuthError::InvalidSession)?;
+    let actor = state.auth.session_user(session).await?;
+    if !actor.is_admin {
+        return Err(registry_auth::AuthError::NoAccess.into());
+    }
+    let created = state
+        .webhooks
+        .create(input.url, input.events)
+        .await
+        .map_err(|_| crate::AppError::BadRequest("webhook URL must be an http(s) URL"))?;
+    let mut event = RegistryEvent::new(EventKind::WebhookCreated);
+    event.actor = Some(actor.username);
+    event.metadata = json!({"webhook_id": created.webhook.id, "url": created.webhook.url});
+    state.events.record(event).await;
+    Ok(Json(created))
+}
+
+async fn disable_webhook(
+    State(state): State<AppState>,
+    Path(id): Path<Uuid>,
+    headers: HeaderMap,
+) -> Result<impl IntoResponse, crate::AppError> {
+    let session = cookie_value(&headers).ok_or(registry_auth::AuthError::InvalidSession)?;
+    let actor = state.auth.session_user(session).await?;
+    if !actor.is_admin {
+        return Err(registry_auth::AuthError::NoAccess.into());
+    }
+    if !state.webhooks.disable(id).await {
+        return Err(crate::AppError::Catalog(crate::CatalogError::NotFound));
+    }
+    let mut event = RegistryEvent::new(EventKind::WebhookDisabled);
+    event.actor = Some(actor.username);
+    event.metadata = json!({"webhook_id": id});
+    state.events.record(event).await;
+    Ok(StatusCode::NO_CONTENT)
+}
+
+#[derive(Debug, Deserialize)]
 struct CreateTokenRequest {
     name: String,
     scopes: Vec<ScopeInput>,
@@ -1168,6 +1263,8 @@ async fn create_token(
     Json(input): Json<CreateTokenRequest>,
 ) -> Result<impl IntoResponse, crate::AppError> {
     let session = cookie_value(&headers).ok_or(registry_auth::AuthError::InvalidSession)?;
+    let actor = state.auth.session_user(session).await?;
+    let token_name = input.name.clone();
     let scopes = input
         .scopes
         .into_iter()
@@ -1183,12 +1280,15 @@ async fn create_token(
             })
         })
         .collect::<Result<Vec<_>, _>>()?;
-    Ok(Json(
-        state
-            .auth
-            .create_credential_for_session(session, input.name, scopes, input.expires_at)
-            .await?,
-    ))
+    let created = state
+        .auth
+        .create_credential_for_session(session, input.name, scopes, input.expires_at)
+        .await?;
+    let mut event = RegistryEvent::new(EventKind::TokenCreated);
+    event.actor = Some(actor.username);
+    event.metadata = json!({"name": token_name, "credential_id": created.id});
+    state.events.record(event).await;
+    Ok(Json(created))
 }
 
 async fn revoke_token(
@@ -1197,10 +1297,15 @@ async fn revoke_token(
     headers: HeaderMap,
 ) -> Result<impl IntoResponse, crate::AppError> {
     let session = cookie_value(&headers).ok_or(registry_auth::AuthError::InvalidSession)?;
+    let actor = state.auth.session_user(session).await?;
     state
         .auth
         .revoke_credential_for_session(session, id)
         .await?;
+    let mut event = RegistryEvent::new(EventKind::TokenRevoked);
+    event.actor = Some(actor.username);
+    event.metadata = json!({"credential_id": id});
+    state.events.record(event).await;
     Ok(StatusCode::NO_CONTENT)
 }
 
@@ -1229,6 +1334,10 @@ async fn run_gc(
             input.dry_run,
         )
         .await?;
+    let mut event = RegistryEvent::new(EventKind::GarbageCollection);
+    event.actor = Some(user.username);
+    event.metadata = serde_json::to_value(&report).unwrap_or_else(|_| json!({}));
+    state.events.record(event).await;
     Ok(Json(report))
 }
 
@@ -1441,6 +1550,77 @@ mod tests {
                 Request::builder()
                     .method("POST")
                     .uri(format!("/api/v1/auth/tokens/{credential_id}/revoke"))
+                    .header("cookie", &cookie)
+                    .body(Body::empty())
+                    .expect("request"),
+            )
+            .await
+            .expect("response");
+        assert_eq!(response.status(), StatusCode::NO_CONTENT);
+
+        let response = router(state.clone())
+            .oneshot(
+                Request::builder()
+                    .uri("/api/v1/audit?limit=10")
+                    .header("cookie", &cookie)
+                    .body(Body::empty())
+                    .expect("request"),
+            )
+            .await
+            .expect("response");
+        assert_eq!(response.status(), StatusCode::OK);
+        let audit = to_bytes(response.into_body(), usize::MAX)
+            .await
+            .expect("body");
+        assert!(String::from_utf8_lossy(&audit).contains("token_created"));
+
+        let response = router(state.clone())
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/api/v1/webhooks")
+                    .header("content-type", "application/json")
+                    .header("cookie", &cookie)
+                    .body(Body::from(
+                        r#"{"url":"https://hooks.example.com/registry","events":["manifest_pushed"]}"#,
+                    ))
+                    .expect("request"),
+            )
+            .await
+            .expect("response");
+        assert_eq!(response.status(), StatusCode::OK);
+        let webhook: serde_json::Value = serde_json::from_slice(
+            &to_bytes(response.into_body(), usize::MAX)
+                .await
+                .expect("body"),
+        )
+        .expect("webhook json");
+        let webhook_id = webhook["webhook"]["id"]
+            .as_str()
+            .expect("webhook id")
+            .to_owned();
+        assert!(webhook["secret"].as_str().is_some());
+
+        let response = router(state.clone())
+            .oneshot(
+                Request::builder()
+                    .uri("/api/v1/webhooks")
+                    .header("cookie", &cookie)
+                    .body(Body::empty())
+                    .expect("request"),
+            )
+            .await
+            .expect("response");
+        let listed_webhooks = to_bytes(response.into_body(), usize::MAX)
+            .await
+            .expect("body");
+        assert!(!String::from_utf8_lossy(&listed_webhooks).contains("whsec_"));
+
+        let response = router(state)
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri(format!("/api/v1/webhooks/{webhook_id}/disable"))
                     .header("cookie", &cookie)
                     .body(Body::empty())
                     .expect("request"),
