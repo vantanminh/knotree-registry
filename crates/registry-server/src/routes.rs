@@ -51,9 +51,12 @@ pub fn router(state: AppState) -> Router {
         .route("/api/v1/auth/tokens", get(list_tokens).post(create_token))
         .route("/api/v1/auth/tokens/{id}/revoke", post(revoke_token))
         .route("/api/v1/overview", get(overview))
+        .route("/api/v1/instance", get(instance))
         .route("/api/v1/repositories", get(list_repositories))
         .route("/api/v1/repositories/{*repository}", get(repository_detail))
         .route("/api/v1/audit", get(list_audit))
+        .route("/api/v1/storage", get(storage_overview))
+        .route("/api/v1/uploads", get(list_uploads))
         .route("/api/v1/webhooks", get(list_webhooks).post(create_webhook))
         .route("/api/v1/webhooks/{id}/disable", post(disable_webhook))
         .route("/api/v1/admin/gc", post(run_gc));
@@ -721,6 +724,7 @@ async fn upload_session(
     }
 }
 
+#[allow(clippy::result_large_err)]
 async fn to_body(request: Request<Body>, limit: usize) -> Result<bytes::Bytes, Response> {
     axum::body::to_bytes(request.into_body(), limit)
         .await
@@ -1240,13 +1244,45 @@ async fn overview(
 ) -> Result<impl IntoResponse, crate::AppError> {
     let session = cookie_value(&headers).ok_or(registry_auth::AuthError::InvalidSession)?;
     let user = state.auth.session_user(session).await?;
-    let repositories = state.catalog.repositories().await;
+    let inventory = state.catalog.inventory().await;
     let credentials = state.auth.list_credentials_for_session(session).await?;
+    let events = state.events.recent(12).await;
+    let health = state.readiness().await;
     Ok(Json(json!({
         "user": user,
-        "repository_count": repositories.len(),
-        "repositories": repositories,
+        "repository_count": inventory.repository_count,
+        "repositories": inventory.repositories,
+        "storage_bytes": inventory.total_bytes,
+        "referenced_bytes": inventory.referenced_bytes,
+        "unreferenced_bytes": inventory.unreferenced_bytes,
         "active_token_count": credentials.iter().filter(|credential| credential.revoked_at.is_none()).count(),
+        "events": events,
+        "health": health,
+        "uptime_seconds": state.started_at.elapsed().as_secs(),
+    })))
+}
+
+async fn instance(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+) -> Result<impl IntoResponse, crate::AppError> {
+    let session = cookie_value(&headers).ok_or(registry_auth::AuthError::InvalidSession)?;
+    let _ = state.auth.session_user(session).await?;
+    let public_url = url::Url::parse(&state.config.public_url).ok();
+    let host = public_url
+        .as_ref()
+        .and_then(|value| value.host_str())
+        .unwrap_or("registry.knotree.org");
+    Ok(Json(json!({
+        "public_url": state.config.public_url,
+        "registry_host": host,
+        "environment": format!("{:?}", state.config.environment).to_ascii_lowercase(),
+        "storage_backend": format!("{:?}", state.config.storage_backend).to_ascii_lowercase(),
+        "storage_bucket": state.config.r2_bucket,
+        "pull_mode": format!("{:?}", state.config.pull_mode).to_ascii_lowercase(),
+        "token_service": state.config.token_service,
+        "token_ttl_seconds": state.config.token_ttl_seconds,
+        "registration": "closed",
     })))
 }
 
@@ -1256,14 +1292,30 @@ async fn list_repositories(
 ) -> Result<impl IntoResponse, crate::AppError> {
     let session = cookie_value(&headers).ok_or(registry_auth::AuthError::InvalidSession)?;
     let _ = state.auth.session_user(session).await?;
-    let repositories = state
-        .catalog
-        .repositories()
-        .await
-        .into_iter()
-        .map(|name| json!({"name": name, "visibility": "private"}))
-        .collect::<Vec<_>>();
-    Ok(Json(json!({"repositories": repositories})))
+    Ok(Json(
+        json!({"repositories": state.catalog.inventory().await.repositories}),
+    ))
+}
+
+async fn storage_overview(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+) -> Result<impl IntoResponse, crate::AppError> {
+    let session = cookie_value(&headers).ok_or(registry_auth::AuthError::InvalidSession)?;
+    let _ = state.auth.session_user(session).await?;
+    Ok(Json(state.catalog.inventory().await))
+}
+
+async fn list_uploads(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+) -> Result<impl IntoResponse, crate::AppError> {
+    let session = cookie_value(&headers).ok_or(registry_auth::AuthError::InvalidSession)?;
+    let user = state.auth.session_user(session).await?;
+    if !user.is_admin {
+        return Err(registry_auth::AuthError::NoAccess.into());
+    }
+    Ok(Json(json!({"uploads": state.uploads.list().await})))
 }
 
 async fn repository_detail(
@@ -1285,6 +1337,8 @@ async fn repository_detail(
             "media_type": manifest.media_type,
             "size": manifest.size,
             "created_at": manifest.created_at,
+            "references": manifest.references,
+            "subject": manifest.subject,
         }));
     }
     Ok(Json(
