@@ -6,8 +6,10 @@ license.workspace = true
 
 [dependencies]
 axum.workspace = true
+base64.workspace = true
 chrono.workspace = true
 dotenvy.workspace = true
+registry-auth = { path = "../registry-auth" }
 registry-core = { path = "../registry-core" }
 registry-db = { path = "../registry-db" }
 registry-storage = { path = "../registry-storage" }

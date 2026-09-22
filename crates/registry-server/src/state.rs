@@ -1,5 +1,6 @@
 use std::{sync::Arc, time::Instant};
 
+use registry_auth::AuthService;
 use registry_db::Database;
 use registry_storage::{DynObjectStore, LocalFileStore, MemoryObjectStore};
 
@@ -10,6 +11,7 @@ pub struct AppState {
     pub config: Arc<AppConfig>,
     pub store: DynObjectStore,
     pub database: Option<Database>,
+    pub auth: Arc<AuthService>,
     pub started_at: Instant,
 }
 
@@ -38,10 +40,24 @@ impl AppState {
             }
             None => None,
         };
+        let auth = Arc::new(AuthService::new(
+            config.token_issuer.clone(),
+            config.token_service.clone(),
+            config.token_ttl_seconds,
+        ));
+        if let (Some(username), Some(password)) = (
+            config.bootstrap_admin_username.as_deref(),
+            config.bootstrap_admin_password.as_deref(),
+        ) {
+            auth.bootstrap_admin(username, password)
+                .await
+                .map_err(AppError::Auth)?;
+        }
         Ok(Self {
             config: Arc::new(config),
             store,
             database,
+            auth,
             started_at: Instant::now(),
         })
     }

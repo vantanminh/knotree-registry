@@ -25,3 +25,5 @@ curl http://127.0.0.1:8080/v2/
 `registry-core` owns digest, repository and authorization-scope types without depending on HTTP or storage. `registry-storage` owns the object-store contract and safe local test implementations. `registry-db` owns PostgreSQL connectivity and migrations. `registry-server` is the Axum interface and orchestration layer. OCI `/v2` handlers and the `/api/v1` control plane will remain separate as later stories land.
 
 See [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md), [docs/decisions/DEC-001.md](docs/decisions/DEC-001.md), and the Harness story files for the implementation trace.
+
+Authentication details and the Docker token exchange are documented in [docs/product/AUTHENTICATION.md](docs/product/AUTHENTICATION.md). The OCI data-plane handlers are being added in the next implementation slice; the current `/v2/` route is only the foundation handshake.

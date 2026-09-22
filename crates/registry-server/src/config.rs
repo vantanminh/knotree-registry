@@ -19,6 +19,12 @@ pub struct AppConfig {
     pub storage_backend: StorageBackend,
     pub storage_root: PathBuf,
     pub request_body_limit_bytes: usize,
+    pub token_issuer: String,
+    pub token_service: String,
+    pub token_ttl_seconds: u64,
+    pub bootstrap_admin_username: Option<String>,
+    pub bootstrap_admin_password: Option<String>,
+    pub cookie_secure: bool,
 }
 
 #[derive(Debug, Error)]
@@ -35,6 +41,8 @@ pub enum ConfigError {
     MissingDatabase,
     #[error("R2 storage is not configured in this build; use STORAGE_BACKEND=local or memory")]
     R2Unavailable,
+    #[error("BOOTSTRAP_ADMIN_USERNAME and BOOTSTRAP_ADMIN_PASSWORD must be set together")]
+    BootstrapCredentialsIncomplete,
 }
 
 impl AppConfig {
@@ -62,6 +70,18 @@ impl AppConfig {
         let storage_root =
             PathBuf::from(env::var("STORAGE_ROOT").unwrap_or_else(|_| "./data/objects".to_owned()));
         let request_body_limit_bytes = parse_usize("REQUEST_BODY_LIMIT_BYTES", 4 * 1024 * 1024)?;
+        let token_issuer =
+            env::var("TOKEN_ISSUER").unwrap_or_else(|_| "knotree-registry".to_owned());
+        let token_service =
+            env::var("TOKEN_SERVICE").unwrap_or_else(|_| "knotree-registry".to_owned());
+        let token_ttl_seconds = parse_u64("REGISTRY_TOKEN_TTL_SECONDS", 300)?;
+        let bootstrap_admin_username = env::var("BOOTSTRAP_ADMIN_USERNAME")
+            .ok()
+            .filter(|value| !value.trim().is_empty());
+        let bootstrap_admin_password = env::var("BOOTSTRAP_ADMIN_PASSWORD")
+            .ok()
+            .filter(|value| !value.trim().is_empty());
+        let cookie_secure = parse_bool("COOKIE_SECURE", true)?;
         let config = Self {
             bind_addr,
             public_url,
@@ -71,6 +91,12 @@ impl AppConfig {
             storage_backend,
             storage_root,
             request_body_limit_bytes,
+            token_issuer,
+            token_service,
+            token_ttl_seconds,
+            bootstrap_admin_username,
+            bootstrap_admin_password,
+            cookie_secure,
         };
         config.validate()?;
         Ok(config)
@@ -86,6 +112,15 @@ impl AppConfig {
         if self.storage_backend == StorageBackend::R2 {
             return Err(ConfigError::R2Unavailable);
         }
+        if self.token_ttl_seconds < 60 || self.token_ttl_seconds > 3600 {
+            return Err(ConfigError::Number(
+                "REGISTRY_TOKEN_TTL_SECONDS",
+                self.token_ttl_seconds.to_string(),
+            ));
+        }
+        if self.bootstrap_admin_username.is_some() != self.bootstrap_admin_password.is_some() {
+            return Err(ConfigError::BootstrapCredentialsIncomplete);
+        }
         Ok(())
     }
 }
@@ -97,6 +132,12 @@ fn parse_u32(name: &'static str, default: u32) -> Result<u32, ConfigError> {
 }
 
 fn parse_usize(name: &'static str, default: usize) -> Result<usize, ConfigError> {
+    env::var(name).map_or(Ok(default), |value| {
+        value.parse().map_err(|_| ConfigError::Number(name, value))
+    })
+}
+
+fn parse_u64(name: &'static str, default: u64) -> Result<u64, ConfigError> {
     env::var(name).map_or(Ok(default), |value| {
         value.parse().map_err(|_| ConfigError::Number(name, value))
     })
