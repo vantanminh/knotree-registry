@@ -72,6 +72,17 @@ pub struct CredentialCreated {
 }
 
 #[derive(Debug, Clone, Serialize)]
+pub struct CredentialSummary {
+    pub id: Uuid,
+    pub name: String,
+    pub prefix: String,
+    pub scopes: Vec<RepositoryScope>,
+    pub expires_at: Option<u64>,
+    pub last_used_at: Option<u64>,
+    pub revoked_at: Option<u64>,
+}
+
+#[derive(Debug, Clone, Serialize)]
 pub struct MintedToken {
     pub token: String,
     pub expires_in: u64,
@@ -106,6 +117,7 @@ struct UserRecord {
 struct CredentialRecord {
     id: Uuid,
     user_id: Uuid,
+    name: String,
     prefix: String,
     verifier: SecretVerifier,
     scopes: Vec<RepositoryScope>,
@@ -221,6 +233,28 @@ impl AuthService {
             .await
     }
 
+    pub async fn list_credentials_for_session(
+        &self,
+        session_token: &str,
+    ) -> Result<Vec<CredentialSummary>, AuthError> {
+        let user_id = self.session_user_id(session_token).await?;
+        let state = self.state.read().await;
+        Ok(state
+            .credentials
+            .values()
+            .filter(|credential| credential.user_id == user_id)
+            .map(|credential| CredentialSummary {
+                id: credential.id,
+                name: credential.name.clone(),
+                prefix: credential.prefix.clone(),
+                scopes: credential.scopes.clone(),
+                expires_at: credential.expires_at,
+                last_used_at: credential.last_used_at,
+                revoked_at: credential.revoked_at,
+            })
+            .collect())
+    }
+
     pub async fn issue_credential_for_user(
         &self,
         user_id: Uuid,
@@ -235,6 +269,7 @@ impl AuthService {
         let credential = CredentialRecord {
             id: Uuid::new_v4(),
             user_id,
+            name: name.clone(),
             prefix: prefix.clone(),
             verifier,
             scopes: scopes.clone(),

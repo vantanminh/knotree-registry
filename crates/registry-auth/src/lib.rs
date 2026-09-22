@@ -5,5 +5,6 @@ mod secret;
 mod service;
 
 pub use service::{
-    AuthError, AuthService, CredentialCreated, MintedToken, Session, UserSummary, parse_scope,
+    AuthError, AuthService, CredentialCreated, CredentialSummary, MintedToken, Session,
+    UserSummary, parse_scope,
 };

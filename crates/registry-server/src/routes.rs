@@ -39,8 +39,11 @@ pub fn router(state: AppState) -> Router {
         .route("/api/v1/auth/login", post(login))
         .route("/api/v1/auth/logout", post(logout))
         .route("/api/v1/auth/me", get(me))
-        .route("/api/v1/auth/tokens", post(create_token))
+        .route("/api/v1/auth/tokens", get(list_tokens).post(create_token))
         .route("/api/v1/auth/tokens/{id}/revoke", post(revoke_token))
+        .route("/api/v1/overview", get(overview))
+        .route("/api/v1/repositories", get(list_repositories))
+        .route("/api/v1/repositories/{*repository}", get(repository_detail))
         .route("/api/v1/admin/gc", post(run_gc))
         .with_state(state)
         .layer(middleware::from_fn(request_id))
@@ -909,11 +912,79 @@ async fn me(
     Ok(Json(state.auth.session_user(session).await?))
 }
 
+async fn overview(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+) -> Result<impl IntoResponse, crate::AppError> {
+    let session = cookie_value(&headers).ok_or(registry_auth::AuthError::InvalidSession)?;
+    let user = state.auth.session_user(session).await?;
+    let repositories = state.catalog.repositories().await;
+    let credentials = state.auth.list_credentials_for_session(session).await?;
+    Ok(Json(json!({
+        "user": user,
+        "repository_count": repositories.len(),
+        "repositories": repositories,
+        "active_token_count": credentials.iter().filter(|credential| credential.revoked_at.is_none()).count(),
+    })))
+}
+
+async fn list_repositories(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+) -> Result<impl IntoResponse, crate::AppError> {
+    let session = cookie_value(&headers).ok_or(registry_auth::AuthError::InvalidSession)?;
+    let _ = state.auth.session_user(session).await?;
+    let repositories = state
+        .catalog
+        .repositories()
+        .await
+        .into_iter()
+        .map(|name| json!({"name": name, "visibility": "private"}))
+        .collect::<Vec<_>>();
+    Ok(Json(json!({"repositories": repositories})))
+}
+
+async fn repository_detail(
+    State(state): State<AppState>,
+    Path(repository): Path<String>,
+    headers: HeaderMap,
+) -> Result<impl IntoResponse, crate::AppError> {
+    let session = cookie_value(&headers).ok_or(registry_auth::AuthError::InvalidSession)?;
+    let _ = state.auth.session_user(session).await?;
+    let repository = RepositoryName::parse(&repository)
+        .map_err(|_| crate::AppError::BadRequest("invalid repository name"))?;
+    let (tags, _) = state.catalog.list_tags(&repository, None, 1000).await?;
+    let mut entries = Vec::with_capacity(tags.len());
+    for tag in tags {
+        let manifest = state.catalog.resolve_manifest(&repository, &tag).await?;
+        entries.push(json!({
+            "tag": tag,
+            "digest": manifest.digest,
+            "media_type": manifest.media_type,
+            "size": manifest.size,
+            "created_at": manifest.created_at,
+        }));
+    }
+    Ok(Json(
+        json!({"name": repository, "visibility": "private", "tags": entries}),
+    ))
+}
+
 #[derive(Debug, Deserialize)]
 struct CreateTokenRequest {
     name: String,
     scopes: Vec<ScopeInput>,
     expires_at: Option<u64>,
+}
+
+async fn list_tokens(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+) -> Result<impl IntoResponse, crate::AppError> {
+    let session = cookie_value(&headers).ok_or(registry_auth::AuthError::InvalidSession)?;
+    Ok(Json(
+        json!({"tokens": state.auth.list_credentials_for_session(session).await?}),
+    ))
 }
 
 #[derive(Debug, Deserialize)]
@@ -1105,6 +1176,106 @@ mod tests {
             .expect("response");
         assert_eq!(response.status(), StatusCode::OK);
         assert!(response.headers().contains_key("x-request-id"));
+    }
+
+    #[tokio::test]
+    async fn control_plane_session_and_token_lifecycle_is_cookie_scoped() {
+        let state = AppState::initialize(test_config()).await.expect("state");
+        state
+            .auth
+            .bootstrap_admin("admin", "correct horse battery staple")
+            .await
+            .expect("bootstrap");
+
+        let response = router(state.clone())
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/api/v1/auth/login")
+                    .header("content-type", "application/json")
+                    .body(Body::from(
+                        r#"{"username":"admin","password":"correct horse battery staple"}"#,
+                    ))
+                    .expect("request"),
+            )
+            .await
+            .expect("response");
+        assert_eq!(response.status(), StatusCode::OK);
+        let cookie = response
+            .headers()
+            .get("set-cookie")
+            .expect("session cookie")
+            .to_str()
+            .expect("cookie header")
+            .split(';')
+            .next()
+            .expect("cookie pair")
+            .to_owned();
+
+        let response = router(state.clone())
+            .oneshot(
+                Request::builder()
+                    .uri("/api/v1/overview")
+                    .header("cookie", &cookie)
+                    .body(Body::empty())
+                    .expect("request"),
+            )
+            .await
+            .expect("response");
+        assert_eq!(response.status(), StatusCode::OK);
+
+        let response = router(state.clone())
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/api/v1/auth/tokens")
+                    .header("content-type", "application/json")
+                    .header("cookie", &cookie)
+                    .body(Body::from(
+                        r#"{"name":"ci","scopes":[{"repository":"team/app","actions":["pull","push"]}]}"#,
+                    ))
+                    .expect("request"),
+            )
+            .await
+            .expect("response");
+        assert_eq!(response.status(), StatusCode::OK);
+        let created: serde_json::Value = serde_json::from_slice(
+            &to_bytes(response.into_body(), usize::MAX)
+                .await
+                .expect("body"),
+        )
+        .expect("credential json");
+        let credential_id = created["id"].as_str().expect("credential id").to_owned();
+        assert!(created["secret"].as_str().is_some());
+
+        let response = router(state.clone())
+            .oneshot(
+                Request::builder()
+                    .uri("/api/v1/auth/tokens")
+                    .header("cookie", &cookie)
+                    .body(Body::empty())
+                    .expect("request"),
+            )
+            .await
+            .expect("response");
+        assert_eq!(response.status(), StatusCode::OK);
+        let listed = to_bytes(response.into_body(), usize::MAX)
+            .await
+            .expect("body");
+        assert!(String::from_utf8_lossy(&listed).contains("ci"));
+
+        let response = router(state.clone())
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri(format!("/api/v1/auth/tokens/{credential_id}/revoke"))
+                    .header("cookie", &cookie)
+                    .body(Body::empty())
+                    .expect("request"),
+            )
+            .await
+            .expect("response");
+        assert_eq!(response.status(), StatusCode::NO_CONTENT);
     }
 
     #[tokio::test]

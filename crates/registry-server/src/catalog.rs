@@ -345,6 +345,16 @@ impl Catalog {
             .get(repository.as_str())
             .map_or(0, |record| record.manifests.len())
     }
+
+    pub async fn repositories(&self) -> Vec<String> {
+        self.state
+            .read()
+            .await
+            .repositories
+            .keys()
+            .cloned()
+            .collect()
+    }
 }
 
 fn resolve_digest(repository: &RepositoryRecord, reference: &str) -> Result<Digest, CatalogError> {
