@@ -76,7 +76,8 @@ The registry keeps an outbox in the PostgreSQL runtime snapshot and sends
 deliveries from one worker per registry instance. It retries network errors,
 timeouts, 408, 429 and 5xx responses up to six attempts with exponential
 backoff (2s, 4s, 8s, 16s and 32s). Other 4xx responses are permanent
-failures. The contract is at-least-once, so receivers must be idempotent.
+failures, as are redirects. The contract is at-least-once, so receivers must
+be idempotent.
 
 ## GitHub Actions bridge
 

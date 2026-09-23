@@ -152,9 +152,12 @@ impl WebhookRegistry {
         events: BTreeSet<EventKind>,
     ) -> Result<WebhookCreated, WebhookError> {
         let parsed_url = url::Url::parse(&url);
-        if !parsed_url
-            .is_ok_and(|url| matches!(url.scheme(), "https" | "http") && url.host_str().is_some())
-        {
+        if !parsed_url.is_ok_and(|url| {
+            matches!(url.scheme(), "https" | "http")
+                && url.host_str().is_some()
+                && url.username().is_empty()
+                && url.password().is_none()
+        }) {
             return Err(WebhookError::InvalidUrl);
         }
         let id = Uuid::new_v4();
@@ -432,6 +435,9 @@ impl RetryPolicy {
     ) -> DeliveryDecision {
         match status {
             Ok(code) if (200..300).contains(&code) => DeliveryDecision::Succeeded,
+            Ok(code) if (300..400).contains(&code) => {
+                DeliveryDecision::Failed { status: Some(code) }
+            }
             Ok(code) if (400..500).contains(&code) && code != 408 && code != 429 => {
                 DeliveryDecision::Failed { status: Some(code) }
             }
@@ -525,6 +531,10 @@ mod tests {
                 ..
             }
         ));
+        assert_eq!(
+            policy.next_attempt(1, Ok(307), 100),
+            DeliveryDecision::Failed { status: Some(307) }
+        );
         assert_eq!(
             policy.next_attempt(6, Ok(503), 100),
             DeliveryDecision::Failed { status: Some(503) }

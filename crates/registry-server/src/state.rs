@@ -218,6 +218,7 @@ impl AppState {
         tokio::spawn(async move {
             let client = match reqwest::Client::builder()
                 .timeout(Duration::from_secs(10))
+                .redirect(reqwest::redirect::Policy::none())
                 .user_agent("knotree-registry-webhook/1")
                 .build()
             {
