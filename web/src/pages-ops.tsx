@@ -390,7 +390,7 @@ export function WebhooksPage({ admin }: { admin: boolean }) {
     try {
       const result = await api<{ webhook: Webhook; secret: string }>("/api/v1/webhooks", {
         method: "POST",
-        body: JSON.stringify({ url, events: ["manifest_pushed", "tag_updated", "manifest_deleted"] })
+        body: JSON.stringify({ url, events: ["tag_updated"] })
       });
       setSecret(result.secret);
       setUrl("");
@@ -404,7 +404,7 @@ export function WebhooksPage({ admin }: { admin: boolean }) {
   if (!webhooks) return <Skeleton />;
   return (
     <>
-      <PageHeader title="Webhooks" description="Deliver signed registry events to an explicitly configured endpoint." />
+      <PageHeader title="Webhooks" description="Deliver signed image tag events to a deployment endpoint; consumers should deploy the immutable digest in the payload." />
       {secret && (
         <div className="alert warn" style={{ marginBottom: 16 }}>
           Save this webhook secret now. It is not returned by later requests.
@@ -467,7 +467,7 @@ export function WebhooksPage({ admin }: { admin: boolean }) {
             </table>
           </div>
         ) : (
-          <EmptyState title="No webhooks" text="Add an endpoint to receive signed push and security events." />
+          <EmptyState title="No webhooks" text="Add an endpoint to receive signed image publication events." />
         )}
       </section>
     </>

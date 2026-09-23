@@ -1,14 +1,17 @@
 use std::{
     sync::Arc,
-    time::{Duration, Instant},
+    time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
 
 use registry_auth::AuthService;
 use registry_db::Database;
-use registry_events::{EventLog, WebhookRegistry};
+use registry_events::{
+    DeliveryDecision, EventLog, PendingWebhookDelivery, RetryPolicy, WebhookRegistry,
+};
 use registry_storage::{DynObjectStore, LocalFileStore, MemoryObjectStore, R2ObjectStore};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
+use tokio::task::JoinHandle;
 
 use crate::{AppConfig, AppError, Catalog, Metrics, StorageBackend, UploadManager};
 
@@ -200,6 +203,94 @@ impl AppState {
             .map_err(AppError::Database)
     }
 
+    pub async fn record_event(&self, event: registry_events::RegistryEvent) {
+        self.events.record(event.clone()).await;
+        let queued = self.webhooks.enqueue(event).await;
+        if queued > 0 {
+            tracing::debug!(deliveries = queued, "queued webhook deliveries");
+        }
+    }
+
+    /// Start the single-instance webhook outbox worker. The handle should be kept
+    /// alive for the lifetime of the server and is aborted with the Tokio runtime.
+    pub fn start_webhook_delivery_worker(&self) -> JoinHandle<()> {
+        let state = self.clone();
+        tokio::spawn(async move {
+            let client = match reqwest::Client::builder()
+                .timeout(Duration::from_secs(10))
+                .user_agent("knotree-registry-webhook/1")
+                .build()
+            {
+                Ok(client) => client,
+                Err(error) => {
+                    tracing::error!(%error, "webhook HTTP client initialization failed");
+                    return;
+                }
+            };
+            let policy = RetryPolicy::default();
+            loop {
+                let now = now_seconds();
+                let deliveries = state.webhooks.due_deliveries(now).await;
+                for pending in deliveries {
+                    if !state.webhooks.is_enabled(pending.webhook_id).await {
+                        state.webhooks.complete(pending.delivery.id).await;
+                        continue;
+                    }
+                    let attempt = pending.attempt.saturating_add(1);
+                    let result = send_webhook(&client, &pending, attempt).await;
+                    let status = result.as_ref().copied().map_err(|_| "request failed");
+                    match policy.next_attempt(attempt, status, now) {
+                        DeliveryDecision::Succeeded => {
+                            state.webhooks.complete(pending.delivery.id).await;
+                            tracing::debug!(
+                                webhook_id = %pending.webhook_id,
+                                delivery_id = %pending.delivery.id,
+                                attempt,
+                                "webhook delivered"
+                            );
+                        }
+                        DeliveryDecision::Retry {
+                            attempt,
+                            not_before,
+                            status,
+                        } => {
+                            state
+                                .webhooks
+                                .retry(pending.delivery.id, attempt, not_before)
+                                .await;
+                            tracing::warn!(
+                                webhook_id = %pending.webhook_id,
+                                delivery_id = %pending.delivery.id,
+                                attempt,
+                                ?status,
+                                not_before,
+                                error = result.as_ref().err().map(String::as_str),
+                                "webhook delivery will retry"
+                            );
+                        }
+                        DeliveryDecision::Failed { status } => {
+                            state.webhooks.complete(pending.delivery.id).await;
+                            tracing::error!(
+                                webhook_id = %pending.webhook_id,
+                                delivery_id = %pending.delivery.id,
+                                attempt,
+                                ?status,
+                                error = result.as_ref().err().map(String::as_str),
+                                "webhook delivery failed permanently"
+                            );
+                        }
+                    }
+                    if state.database.is_some()
+                        && let Err(error) = state.persist_runtime_state().await
+                    {
+                        tracing::error!(%error, "webhook outbox persistence failed");
+                    }
+                }
+                tokio::time::sleep(Duration::from_secs(1)).await;
+            }
+        })
+    }
+
     pub async fn readiness(&self) -> Readiness {
         let storage = if self.store.health().await.is_ok() {
             "ok"
@@ -219,4 +310,36 @@ impl AppState {
             database,
         }
     }
+}
+
+async fn send_webhook(
+    client: &reqwest::Client,
+    pending: &PendingWebhookDelivery,
+    attempt: u32,
+) -> Result<u16, String> {
+    let delivery = &pending.delivery;
+    let event_kind = serde_json::to_string(&delivery.event.kind)
+        .unwrap_or_else(|_| "unknown".to_owned())
+        .trim_matches('"')
+        .to_owned();
+    let response = client
+        .post(&pending.url)
+        .header("content-type", "application/json")
+        .header("x-knotree-event", event_kind)
+        .header("x-knotree-delivery", delivery.id.to_string())
+        .header("x-knotree-timestamp", delivery.timestamp.to_string())
+        .header("x-knotree-signature", &delivery.signature)
+        .header("x-knotree-attempt", attempt.to_string())
+        .body(delivery.body.clone())
+        .send()
+        .await
+        .map_err(|error| error.to_string())?;
+    Ok(response.status().as_u16())
+}
+
+fn now_seconds() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs()
 }

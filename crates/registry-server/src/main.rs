@@ -18,7 +18,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let config = AppConfig::from_env()?;
     let listener = TcpListener::bind(config.bind_addr).await?;
     let address = listener.local_addr()?;
-    let app = router(build_state(config).await?);
+    let state = build_state(config).await?;
+    let _webhook_worker = state.start_webhook_delivery_worker();
+    let app = router(state);
     tracing::info!(%address, "registry server listening");
     axum::serve(listener, app)
         .with_graceful_shutdown(shutdown_signal())

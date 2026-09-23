@@ -13,4 +13,5 @@ sha2.workspace = true
 subtle.workspace = true
 thiserror.workspace = true
 tokio.workspace = true
+url.workspace = true
 uuid.workspace = true

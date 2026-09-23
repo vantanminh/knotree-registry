@@ -82,6 +82,7 @@ pub struct WebhookCreated {
 #[derive(Clone, Default)]
 pub struct WebhookRegistry {
     endpoints: Arc<RwLock<HashMap<Uuid, WebhookEndpoint>>>,
+    deliveries: Arc<RwLock<HashMap<Uuid, PendingWebhookDelivery>>>,
 }
 
 #[derive(Clone, Serialize, Deserialize)]
@@ -90,26 +91,59 @@ struct WebhookEndpoint {
     secret: String,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct PendingWebhookDelivery {
+    pub webhook_id: Uuid,
+    pub url: String,
+    pub delivery: WebhookDelivery,
+    pub attempt: u32,
+    pub next_attempt_at: u64,
+}
+
+#[derive(Serialize, Deserialize)]
+struct WebhookSnapshot {
+    endpoints: Vec<WebhookEndpoint>,
+    #[serde(default)]
+    deliveries: Vec<PendingWebhookDelivery>,
+}
+
+#[derive(Deserialize)]
+#[serde(untagged)]
+enum WebhookSnapshotInput {
+    Current(WebhookSnapshot),
+    Legacy(Vec<WebhookEndpoint>),
+}
+
 impl WebhookRegistry {
     pub fn from_snapshot(value: serde_json::Value) -> Result<Self, serde_json::Error> {
-        let endpoints = serde_json::from_value::<Vec<WebhookEndpoint>>(value)?
+        let snapshot = match serde_json::from_value::<WebhookSnapshotInput>(value)? {
+            WebhookSnapshotInput::Current(snapshot) => snapshot,
+            WebhookSnapshotInput::Legacy(endpoints) => WebhookSnapshot {
+                endpoints,
+                deliveries: Vec::new(),
+            },
+        };
+        let endpoints = snapshot
+            .endpoints
             .into_iter()
             .map(|endpoint| (endpoint.summary.id, endpoint))
             .collect();
+        let deliveries = snapshot
+            .deliveries
+            .into_iter()
+            .map(|delivery| (delivery.delivery.id, delivery))
+            .collect();
         Ok(Self {
             endpoints: Arc::new(RwLock::new(endpoints)),
+            deliveries: Arc::new(RwLock::new(deliveries)),
         })
     }
 
     pub async fn snapshot(&self) -> Result<serde_json::Value, serde_json::Error> {
-        serde_json::to_value(
-            self.endpoints
-                .read()
-                .await
-                .values()
-                .cloned()
-                .collect::<Vec<_>>(),
-        )
+        serde_json::to_value(WebhookSnapshot {
+            endpoints: self.endpoints.read().await.values().cloned().collect(),
+            deliveries: self.deliveries.read().await.values().cloned().collect(),
+        })
     }
 
     pub async fn create(
@@ -117,7 +151,10 @@ impl WebhookRegistry {
         url: String,
         events: BTreeSet<EventKind>,
     ) -> Result<WebhookCreated, WebhookError> {
-        if !(url.starts_with("https://") || url.starts_with("http://")) {
+        let parsed_url = url::Url::parse(&url);
+        if !parsed_url
+            .is_ok_and(|url| matches!(url.scheme(), "https" | "http") && url.host_str().is_some())
+        {
             return Err(WebhookError::InvalidUrl);
         }
         let id = Uuid::new_v4();
@@ -152,17 +189,100 @@ impl WebhookRegistry {
     }
 
     pub async fn disable(&self, id: Uuid) -> bool {
-        self.endpoints
+        let disabled = self
+            .endpoints
             .write()
             .await
             .get_mut(&id)
             .map(|endpoint| endpoint.summary.enabled = false)
-            .is_some()
+            .is_some();
+        if disabled {
+            self.deliveries
+                .write()
+                .await
+                .retain(|_, delivery| delivery.webhook_id != id);
+        }
+        disabled
     }
 
     pub async fn signer(&self, id: Uuid) -> Option<WebhookSigner> {
         let endpoint = self.endpoints.read().await.get(&id).cloned()?;
         WebhookSigner::new(endpoint.secret, Duration::from_secs(300)).ok()
+    }
+
+    /// Add one signed, idempotent outbox entry for every enabled matching endpoint.
+    pub async fn enqueue(&self, event: RegistryEvent) -> usize {
+        let timestamp = now_seconds();
+        let endpoints = self.endpoints.read().await;
+        let mut deliveries = self.deliveries.write().await;
+        let mut count = 0;
+        for endpoint in endpoints.values() {
+            if !endpoint.summary.enabled
+                || (!endpoint.summary.events.is_empty()
+                    && !endpoint.summary.events.contains(&event.kind))
+            {
+                continue;
+            }
+            let Ok(signer) = WebhookSigner::new(&endpoint.secret, Duration::from_secs(300)) else {
+                continue;
+            };
+            let delivery = signer.delivery(event.clone(), timestamp);
+            let id = delivery.id;
+            deliveries.insert(
+                id,
+                PendingWebhookDelivery {
+                    webhook_id: endpoint.summary.id,
+                    url: endpoint.summary.url.clone(),
+                    delivery,
+                    attempt: 0,
+                    next_attempt_at: timestamp,
+                },
+            );
+            count += 1;
+        }
+        count
+    }
+
+    pub async fn due_deliveries(&self, now: u64) -> Vec<PendingWebhookDelivery> {
+        let endpoints = self.endpoints.read().await;
+        self.deliveries
+            .read()
+            .await
+            .values()
+            .filter(|delivery| {
+                delivery.next_attempt_at <= now
+                    && endpoints
+                        .get(&delivery.webhook_id)
+                        .is_some_and(|endpoint| endpoint.summary.enabled)
+            })
+            .cloned()
+            .collect()
+    }
+
+    pub async fn is_enabled(&self, webhook_id: Uuid) -> bool {
+        self.endpoints
+            .read()
+            .await
+            .get(&webhook_id)
+            .is_some_and(|endpoint| endpoint.summary.enabled)
+    }
+
+    pub async fn complete(&self, delivery_id: Uuid) -> bool {
+        self.deliveries.write().await.remove(&delivery_id).is_some()
+    }
+
+    pub async fn retry(&self, delivery_id: Uuid, attempt: u32, next_attempt_at: u64) -> bool {
+        let mut deliveries = self.deliveries.write().await;
+        let Some(delivery) = deliveries.get_mut(&delivery_id) else {
+            return false;
+        };
+        delivery.attempt = attempt;
+        delivery.next_attempt_at = next_attempt_at;
+        true
+    }
+
+    pub async fn pending_count(&self) -> usize {
+        self.deliveries.read().await.len()
     }
 }
 
@@ -195,6 +315,13 @@ pub struct WebhookDelivery {
     pub body: Vec<u8>,
     pub timestamp: u64,
     pub signature: String,
+}
+
+#[derive(Serialize)]
+struct WebhookPayload<'a> {
+    schema_version: u16,
+    #[serde(flatten)]
+    event: &'a RegistryEvent,
 }
 
 #[derive(Debug, Error, PartialEq, Eq)]
@@ -254,7 +381,11 @@ impl WebhookSigner {
 
     pub fn delivery(&self, event: RegistryEvent, timestamp: u64) -> WebhookDelivery {
         let id = Uuid::new_v4();
-        let body = serde_json::to_vec(&event).expect("registry event is serializable");
+        let body = serde_json::to_vec(&WebhookPayload {
+            schema_version: 1,
+            event: &event,
+        })
+        .expect("registry event is serializable");
         let signature = self.sign(id, timestamp, &body);
         WebhookDelivery {
             id,
@@ -379,6 +510,26 @@ mod tests {
             DeliveryDecision::Failed { status: Some(401) }
         );
         assert!(matches!(
+            policy.next_attempt(1, Ok(429), 100),
+            DeliveryDecision::Retry {
+                attempt: 2,
+                status: Some(429),
+                ..
+            }
+        ));
+        assert!(matches!(
+            policy.next_attempt(1, Ok(503), 100),
+            DeliveryDecision::Retry {
+                attempt: 2,
+                status: Some(503),
+                ..
+            }
+        ));
+        assert_eq!(
+            policy.next_attempt(6, Ok(503), 100),
+            DeliveryDecision::Failed { status: Some(503) }
+        );
+        assert!(matches!(
             policy.next_attempt(1, Err("timeout"), 100),
             DeliveryDecision::Retry { attempt: 2, .. }
         ));
@@ -399,5 +550,58 @@ mod tests {
         assert!(registry.signer(created.webhook.id).await.is_some());
         assert!(registry.disable(created.webhook.id).await);
         assert!(!registry.list().await[0].enabled);
+    }
+
+    #[tokio::test]
+    async fn webhook_outbox_matches_events_and_survives_snapshot_round_trip() {
+        let registry = WebhookRegistry::default();
+        let created = registry
+            .create(
+                "https://hooks.example.com/registry".to_owned(),
+                [EventKind::TagUpdated].into_iter().collect(),
+            )
+            .await
+            .expect("webhook");
+        let mut event = RegistryEvent::new(EventKind::TagUpdated);
+        event.repository = Some("team/app".to_owned());
+        assert_eq!(registry.enqueue(event.clone()).await, 1);
+        let pending = registry.due_deliveries(now_seconds()).await;
+        assert_eq!(pending.len(), 1);
+        assert_eq!(pending[0].webhook_id, created.webhook.id);
+        assert_eq!(pending[0].delivery.event, event);
+
+        let snapshot = registry.snapshot().await.expect("snapshot");
+        let restored = WebhookRegistry::from_snapshot(snapshot).expect("restore");
+        assert_eq!(restored.pending_count().await, 1);
+        assert!(restored.complete(pending[0].delivery.id).await);
+        assert_eq!(restored.pending_count().await, 0);
+    }
+
+    #[tokio::test]
+    async fn disabling_a_webhook_removes_queued_deliveries() {
+        let registry = WebhookRegistry::default();
+        let created = registry
+            .create(
+                "https://hooks.example.com/registry".to_owned(),
+                BTreeSet::new(),
+            )
+            .await
+            .expect("webhook");
+        assert_eq!(
+            registry
+                .enqueue(RegistryEvent::new(EventKind::TagUpdated))
+                .await,
+            1
+        );
+        assert!(registry.disable(created.webhook.id).await);
+        assert_eq!(registry.pending_count().await, 0);
+    }
+
+    #[tokio::test]
+    async fn legacy_webhook_snapshots_restore_without_an_outbox() {
+        let endpoint = serde_json::json!([]);
+        let registry = WebhookRegistry::from_snapshot(endpoint).expect("legacy snapshot");
+        assert_eq!(registry.list().await.len(), 0);
+        assert_eq!(registry.pending_count().await, 0);
     }
 }

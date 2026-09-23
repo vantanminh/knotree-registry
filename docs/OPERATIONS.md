@@ -8,7 +8,7 @@ The service fails fast in `APP_ENV=production` unless the public URL is HTTPS, P
 
 ## Backups and restore
 
-PostgreSQL stores the runtime snapshot used to restore authorization, tags, local upload sessions, events, webhook registrations and garbage-collection reachability. R2 multipart upload internals are not resumed across a process restart; clients should retry an interrupted upload and the bucket should have a lifecycle rule for abandoned multipart uploads. Take a daily compressed dump and verify it in a disposable database:
+PostgreSQL stores the runtime snapshot used to restore authorization, tags, local upload sessions, events, webhook registrations, pending webhook deliveries and garbage-collection reachability. R2 multipart upload internals are not resumed across a process restart; clients should retry an interrupted upload and the bucket should have a lifecycle rule for abandoned multipart uploads. Take a daily compressed dump and verify it in a disposable database:
 
 ```powershell
 pg_dump --format=custom --file=registry-$(Get-Date -Format yyyyMMdd).dump $env:DATABASE_URL
@@ -25,6 +25,13 @@ R2 contains immutable content-addressed bytes. Preserve the bucket and its lifec
 - Every response includes `X-Request-Id`; pass a trusted incoming ID through the reverse proxy or let the service generate one.
 
 Use structured tracing at `RUST_LOG=info`. Do not log `Authorization`, cookies, PATs, webhook secrets, passwords, or R2 credentials. Scrub reverse-proxy access logs for those headers too.
+
+The webhook worker sends signed image and control-plane events from the
+PostgreSQL-backed outbox. A 2xx response removes a delivery; transient
+network/408/429/5xx failures retry up to six attempts, while other 4xx errors
+are terminal. Monitor worker warnings and keep receivers idempotent by
+`X-Knotree-Delivery`. The complete consumer contract and GitHub bridge are in
+[`docs/DEPLOYMENT_NOTIFICATIONS.md`](DEPLOYMENT_NOTIFICATIONS.md).
 
 ## Maintenance
 
@@ -47,4 +54,4 @@ The active ES256 signing key and `kid` are included in the PostgreSQL runtime sn
 1. Disable the affected webhook or revoke the affected PAT.
 2. Rotate `EDGE_DOWNLOAD_SECRET`, R2 credentials, or webhook secrets through the secret manager; never commit replacements.
 3. If JWT signing material is suspected, restart all registry instances together and invalidate any cached bearer tokens at the proxy.
-4. Preserve request IDs, audit events, delivery history, and the relevant PostgreSQL dump for investigation.
+4. Preserve request IDs, audit events, pending outbox entries, and the relevant PostgreSQL dump for investigation.

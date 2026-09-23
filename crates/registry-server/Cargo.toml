@@ -17,6 +17,7 @@ registry-core = { path = "../registry-core" }
 registry-db = { path = "../registry-db" }
 registry-events = { path = "../registry-events" }
 registry-storage = { path = "../registry-storage" }
+reqwest.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 sha2.workspace = true

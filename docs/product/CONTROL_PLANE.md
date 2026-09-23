@@ -32,10 +32,13 @@ The Vite development server proxies `/api`, `/auth`, and `/v2` to `http://127.0.
 | `POST /api/v1/auth/tokens/{id}/revoke` | Revoke a credential owned by the current user or by an administrator. |
 | `GET /api/v1/audit` | Return recent security-sensitive events for the current session. |
 | `GET /api/v1/webhooks` | List webhook endpoints without revealing secrets. |
-| `POST /api/v1/webhooks` | Create an admin-owned endpoint; the HMAC secret is returned once. |
-| `POST /api/v1/webhooks/{id}/disable` | Disable an endpoint without deleting delivery history. |
+| `POST /api/v1/webhooks` | Create an admin-owned endpoint; the HMAC secret is returned once. Matching events are queued in the durable outbox and delivered with signed HTTP retries. |
+| `POST /api/v1/webhooks/{id}/disable` | Disable an endpoint and stop queued deliveries. |
 | `POST /api/v1/admin/gc` | Run or dry-run mark-and-sweep garbage collection as an administrator. |
 
 Credential secrets are never returned by list endpoints. Action scopes are `pull`, `push`, `delete`, and `admin`; requested scopes are checked against the logged-in user’s credential before they reach the Docker Bearer token service.
+
+For the signed image-publish payload, delivery headers, retry behavior and a
+GitHub Actions bridge, see [deployment notifications](../DEPLOYMENT_NOTIFICATIONS.md).
 
 The current dashboard covers sign-in, overview, repository browsing, one-time token reveal/revoke, password changes, and authenticator-app TOTP setup/disable. Audit and webhook controls are available through the documented control-plane API; they remain separate from the `/v2` protocol so browser cookies never authorize registry requests.

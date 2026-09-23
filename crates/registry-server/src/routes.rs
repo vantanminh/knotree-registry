@@ -434,13 +434,15 @@ async fn put_manifest_response(
     if is_tag {
         event.tag = Some(reference.to_owned());
     }
-    state.events.record(event).await;
+    event.metadata = image_event_metadata(state, repository, &manifest, is_tag, reference);
+    state.record_event(event).await;
     if is_tag {
         let mut tag_event = RegistryEvent::new(EventKind::TagUpdated);
         tag_event.repository = Some(repository.to_string());
         tag_event.tag = Some(reference.to_owned());
         tag_event.digest = Some(manifest.digest.to_string());
-        state.events.record(tag_event).await;
+        tag_event.metadata = image_event_metadata(state, repository, &manifest, true, reference);
+        state.record_event(tag_event).await;
     }
     let mut response = StatusCode::CREATED.into_response();
     response.headers_mut().insert(
@@ -457,6 +459,37 @@ async fn put_manifest_response(
         .insert(CONTENT_LENGTH, HeaderValue::from_static("0"));
     add_protocol_headers(&mut response);
     response
+}
+
+fn image_event_metadata(
+    state: &AppState,
+    repository: &RepositoryName,
+    manifest: &crate::StoredManifest,
+    is_tag: bool,
+    reference: &str,
+) -> serde_json::Value {
+    let public_url = state.config.public_url.trim_end_matches('/');
+    let host = url::Url::parse(public_url)
+        .ok()
+        .and_then(|url| {
+            url.host_str().map(|host| match url.port() {
+                Some(port) => format!("{host}:{port}"),
+                None => host.to_owned(),
+            })
+        })
+        .unwrap_or_else(|| "registry.knotree.com".to_owned());
+    let immutable_image = format!("{host}/{repository}@{}", manifest.digest);
+    let tagged_image = is_tag.then(|| format!("{host}/{repository}:{reference}"));
+    json!({
+        "registry": host,
+        "immutable_image": immutable_image,
+        "tagged_image": tagged_image,
+        "manifest_url": format!("{public_url}/v2/{repository}/manifests/{}", manifest.digest),
+        "media_type": manifest.media_type,
+        "size": manifest.size,
+        "published_reference": reference,
+        "is_tag": is_tag,
+    })
 }
 
 fn parse_oci_path(path: &str) -> Option<OciPath> {
@@ -510,7 +543,7 @@ async fn delete_manifest_response(
             if Digest::parse(reference).is_err() {
                 event.tag = Some(reference.to_owned());
             }
-            state.events.record(event).await;
+            state.record_event(event).await;
             let mut response = StatusCode::ACCEPTED.into_response();
             response.headers_mut().insert(
                 HeaderName::from_static("docker-content-digest"),
@@ -1211,13 +1244,13 @@ async fn login(
         Err(error) => {
             let mut event = RegistryEvent::new(EventKind::LoginFailed);
             event.actor = Some(input.username.clone());
-            state.events.record(event).await;
+            state.record_event(event).await;
             return Err(error.into());
         }
     };
     let mut event = RegistryEvent::new(EventKind::LoginSucceeded);
     event.actor = Some(input.username.clone());
-    state.events.record(event).await;
+    state.record_event(event).await;
     let mut response =
         Json(json!({"user": session.user, "expires_at": session.expires_at})).into_response();
     response.headers_mut().insert(
@@ -1249,7 +1282,7 @@ async fn change_password(
         .await?;
     let mut event = RegistryEvent::new(EventKind::PasswordChanged);
     event.actor = Some(session.user.username.clone());
-    state.events.record(event).await;
+    state.record_event(event).await;
     let mut response =
         Json(json!({"user": session.user, "expires_at": session.expires_at})).into_response();
     response.headers_mut().insert(
@@ -1301,7 +1334,7 @@ async fn confirm_totp_setup(
     let status = state.auth.confirm_totp_setup(session, &input.code).await?;
     let mut event = RegistryEvent::new(EventKind::TwoFactorEnabled);
     event.actor = Some(user.username);
-    state.events.record(event).await;
+    state.record_event(event).await;
     Ok(Json(status))
 }
 
@@ -1324,7 +1357,7 @@ async fn disable_totp(
         .await?;
     let mut event = RegistryEvent::new(EventKind::TwoFactorDisabled);
     event.actor = Some(user.username);
-    state.events.record(event).await;
+    state.record_event(event).await;
     Ok(Json(status))
 }
 
@@ -1512,7 +1545,7 @@ async fn create_webhook(
     let mut event = RegistryEvent::new(EventKind::WebhookCreated);
     event.actor = Some(actor.username);
     event.metadata = json!({"webhook_id": created.webhook.id, "url": created.webhook.url});
-    state.events.record(event).await;
+    state.record_event(event).await;
     Ok(Json(created))
 }
 
@@ -1532,7 +1565,7 @@ async fn disable_webhook(
     let mut event = RegistryEvent::new(EventKind::WebhookDisabled);
     event.actor = Some(actor.username);
     event.metadata = json!({"webhook_id": id});
-    state.events.record(event).await;
+    state.record_event(event).await;
     Ok(StatusCode::NO_CONTENT)
 }
 
@@ -1589,7 +1622,7 @@ async fn create_token(
     let mut event = RegistryEvent::new(EventKind::TokenCreated);
     event.actor = Some(actor.username);
     event.metadata = json!({"name": token_name, "credential_id": created.id});
-    state.events.record(event).await;
+    state.record_event(event).await;
     Ok(Json(created))
 }
 
@@ -1607,7 +1640,7 @@ async fn revoke_token(
     let mut event = RegistryEvent::new(EventKind::TokenRevoked);
     event.actor = Some(actor.username);
     event.metadata = json!({"credential_id": id});
-    state.events.record(event).await;
+    state.record_event(event).await;
     Ok(StatusCode::NO_CONTENT)
 }
 
@@ -1639,7 +1672,7 @@ async fn run_gc(
     let mut event = RegistryEvent::new(EventKind::GarbageCollection);
     event.actor = Some(user.username);
     event.metadata = serde_json::to_value(&report).unwrap_or_else(|_| json!({}));
-    state.events.record(event).await;
+    state.record_event(event).await;
     Ok(Json(report))
 }
 
@@ -1695,12 +1728,18 @@ fn expired_session_cookie(state: &AppState) -> HeaderValue {
 #[cfg(test)]
 mod tests {
     use axum::{
+        Router,
         body::{Body, to_bytes},
+        extract::State as AxumState,
         http::{Request, StatusCode},
+        routing::post,
     };
     use bytes::Bytes;
     use registry_auth::parse_scope;
     use registry_core::{Digest, RepositoryName};
+    use registry_events::WebhookSigner;
+    use std::time::Duration;
+    use tokio::{net::TcpListener, sync::mpsc, time::timeout};
     use tower::util::ServiceExt;
 
     use super::*;
@@ -1735,6 +1774,20 @@ mod tests {
             edge_download_secret: None,
             control_plane_origins: Vec::new(),
         }
+    }
+
+    #[derive(Clone)]
+    struct WebhookCapture {
+        tx: mpsc::UnboundedSender<(HeaderMap, Bytes)>,
+    }
+
+    async fn capture_webhook(
+        AxumState(capture): AxumState<WebhookCapture>,
+        headers: HeaderMap,
+        body: Bytes,
+    ) -> StatusCode {
+        capture.tx.send((headers, body)).expect("capture receiver");
+        StatusCode::OK
     }
 
     #[tokio::test]
@@ -2239,6 +2292,144 @@ mod tests {
             .await
             .expect("response");
         assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+    }
+
+    #[tokio::test]
+    async fn image_push_delivers_signed_immutable_reference_webhook() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.expect("listener");
+        let address = listener.local_addr().expect("listener address");
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        let webhook_app = Router::new()
+            .route("/hook", post(capture_webhook))
+            .with_state(WebhookCapture { tx });
+        let receiver_task = tokio::spawn(async move {
+            axum::serve(listener, webhook_app)
+                .await
+                .expect("webhook receiver");
+        });
+
+        let state = AppState::initialize(test_config()).await.expect("state");
+        let created = state
+            .webhooks
+            .create(
+                format!("http://{address}/hook"),
+                [EventKind::TagUpdated].into_iter().collect(),
+            )
+            .await
+            .expect("webhook");
+        let worker = state.start_webhook_delivery_worker();
+
+        let user = state
+            .auth
+            .bootstrap_admin("admin", "correct horse battery staple")
+            .await
+            .expect("bootstrap");
+        let credential = state
+            .auth
+            .issue_credential_for_user(
+                user.id,
+                "push".to_owned(),
+                vec![parse_scope("repository:team/app:pull,push").expect("scope")],
+                None,
+            )
+            .await
+            .expect("credential");
+        let bearer = state
+            .auth
+            .mint_token(
+                "admin",
+                &credential.secret,
+                "knotree-registry",
+                &[parse_scope("repository:team/app:pull,push").expect("scope")],
+            )
+            .await
+            .expect("bearer")
+            .token;
+        let repository = RepositoryName::parse("team/app").expect("repository");
+        let config = Bytes::from_static(b"config");
+        let config_digest = Digest::sha256(&config);
+        state
+            .store
+            .put(&blob_key(&config_digest), config)
+            .await
+            .expect("config object");
+        state
+            .catalog
+            .attach_blob(&repository, config_digest.clone())
+            .await;
+        let raw = Bytes::from(format!(
+            r#"{{"schemaVersion":2,"mediaType":"application/vnd.oci.image.manifest.v1+json","config":{{"mediaType":"application/vnd.oci.image.config.v1+json","digest":"{config_digest}","size":6}},"layers":[]}}"#
+        ));
+        let digest = Digest::sha256(&raw);
+        let response = router(state.clone())
+            .oneshot(
+                Request::builder()
+                    .method("PUT")
+                    .uri("/v2/team/app/manifests/stable")
+                    .header("authorization", format!("Bearer {bearer}"))
+                    .header("content-type", "application/vnd.oci.image.manifest.v1+json")
+                    .body(Body::from(raw))
+                    .expect("request"),
+            )
+            .await
+            .expect("response");
+        assert_eq!(response.status(), StatusCode::CREATED);
+
+        let (headers, body) = timeout(Duration::from_secs(5), rx.recv())
+            .await
+            .expect("webhook timeout")
+            .expect("webhook request");
+        let payload: serde_json::Value = serde_json::from_slice(&body).expect("payload");
+        assert_eq!(payload["schema_version"], 1);
+        assert_eq!(payload["kind"], "tag_updated");
+        assert_eq!(payload["repository"], "team/app");
+        assert_eq!(payload["tag"], "stable");
+        assert_eq!(payload["digest"], digest.to_string());
+        assert_eq!(
+            payload["metadata"]["immutable_image"],
+            format!("localhost:8080/team/app@{digest}")
+        );
+        assert_eq!(
+            headers["x-knotree-event"].to_str().expect("event header"),
+            "tag_updated"
+        );
+        let delivery_id = Uuid::parse_str(
+            headers["x-knotree-delivery"]
+                .to_str()
+                .expect("delivery header"),
+        )
+        .expect("delivery id");
+        let timestamp = headers["x-knotree-timestamp"]
+            .to_str()
+            .expect("timestamp header")
+            .parse::<u64>()
+            .expect("timestamp");
+        let signer = WebhookSigner::new(&created.secret, Duration::from_secs(300)).expect("signer");
+        signer
+            .verify(
+                delivery_id,
+                timestamp,
+                headers["x-knotree-signature"]
+                    .to_str()
+                    .expect("signature header"),
+                &body,
+                timestamp,
+            )
+            .expect("valid webhook signature");
+        assert_eq!(headers["x-knotree-attempt"], "1");
+
+        timeout(Duration::from_secs(2), async {
+            loop {
+                if state.webhooks.pending_count().await == 0 {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+        })
+        .await
+        .expect("delivery completion");
+        worker.abort();
+        receiver_task.abort();
     }
 
     #[tokio::test]
