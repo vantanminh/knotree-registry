@@ -80,15 +80,17 @@ Cloudflare traffic should use Full (strict) TLS.
 
 ## R2 configuration
 
-The checked-in default is `STORAGE_BACKEND=local`, which is valid for this
-single-node deployment but makes the registry data PVC part of the backup
-plan. To use private Cloudflare R2, create `registry-r2` with all four values,
-then switch the ConfigMap and restart only the registry deployment:
+The dedicated Cloudflare bucket `knotree-registry` has been created for this
+deployment. The checked-in default remains `STORAGE_BACKEND=local`, which is
+valid for this single-node deployment but makes the registry data PVC part of
+the backup plan. To switch to R2, create an Object Read & Write R2 API token
+scoped to that bucket, create `registry-r2` with all four values, then switch
+the ConfigMap and restart only the registry deployment:
 
 ```bash
 k3s kubectl -n "$namespace" create secret generic registry-r2 \
   --from-literal=R2_ENDPOINT='https://<account-id>.r2.cloudflarestorage.com' \
-  --from-literal=R2_BUCKET='<bucket>' \
+  --from-literal=R2_BUCKET='knotree-registry' \
   --from-literal=R2_ACCESS_KEY_ID='<access-key-id>' \
   --from-literal=R2_SECRET_ACCESS_KEY='<secret-access-key>' \
   --dry-run=client -o yaml | k3s kubectl apply -f -
