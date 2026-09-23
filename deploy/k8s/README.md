@@ -81,7 +81,10 @@ Cloudflare traffic should use Full (strict) TLS.
 ## R2 configuration
 
 The dedicated Cloudflare bucket `knotree-registry` has been created for this
-deployment. The checked-in default remains `STORAGE_BACKEND=local`, which is
+deployment and Cloudflare reports its location as `APAC`. Keep
+`R2_REGION=auto`: this is the required signing region for the R2
+S3-compatible API; `APAC` is the bucket's placement, not an SDK region value.
+The checked-in default remains `STORAGE_BACKEND=local`, which is
 valid for this single-node deployment but makes the registry data PVC part of
 the backup plan. To switch to R2, create an Object Read & Write R2 API token
 scoped to that bucket, create `registry-r2` with all four values, then switch
