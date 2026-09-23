@@ -608,6 +608,26 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn webhook_rejects_malformed_and_credential_bearing_urls() {
+        let registry = WebhookRegistry::default();
+        assert_eq!(
+            registry
+                .create("https://".to_owned(), BTreeSet::new())
+                .await,
+            Err(WebhookError::InvalidUrl)
+        );
+        assert_eq!(
+            registry
+                .create(
+                    "https://user:secret@hooks.example.com/registry".to_owned(),
+                    BTreeSet::new()
+                )
+                .await,
+            Err(WebhookError::InvalidUrl)
+        );
+    }
+
+    #[tokio::test]
     async fn legacy_webhook_snapshots_restore_without_an_outbox() {
         let endpoint = serde_json::json!([]);
         let registry = WebhookRegistry::from_snapshot(endpoint).expect("legacy snapshot");
