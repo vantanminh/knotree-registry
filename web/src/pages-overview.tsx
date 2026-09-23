@@ -266,6 +266,8 @@ export function LoginPage({
 }) {
   const [username, setUsername] = useState("");
   const [password, setPassword] = useState("");
+  const [otp, setOtp] = useState("");
+  const [twoFactorRequired, setTwoFactorRequired] = useState(false);
   const [error, setError] = useState("");
   const [busy, setBusy] = useState(false);
   async function submit(event: FormEvent) {
@@ -273,9 +275,13 @@ export function LoginPage({
     setBusy(true);
     setError("");
     try {
-      await api("/api/v1/auth/login", { method: "POST", body: JSON.stringify({ username, password }) });
+      await api("/api/v1/auth/login", {
+        method: "POST",
+        body: JSON.stringify({ username, password, ...(twoFactorRequired ? { otp } : {}) })
+      });
       onLogin();
     } catch (reason) {
+      if ((reason as { code?: string }).code === "two_factor_required") setTwoFactorRequired(true);
       setError(friendlyError(reason));
     } finally {
       setBusy(false);
@@ -296,6 +302,23 @@ export function LoginPage({
             <span>Password</span>
             <input type="password" autoComplete="current-password" value={password} onChange={(event) => setPassword(event.target.value)} required />
           </label>
+          {twoFactorRequired && (
+            <label className="field">
+              <span>Authenticator code</span>
+              <input
+                autoFocus
+                autoComplete="one-time-code"
+                inputMode="numeric"
+                maxLength={6}
+                pattern="[0-9]{6}"
+                value={otp}
+                onChange={(event) => setOtp(event.target.value.replace(/\D/g, "").slice(0, 6))}
+                placeholder="000000"
+                required
+              />
+              <small>Enter the 6-digit code from your authenticator app.</small>
+            </label>
+          )}
           {error && (
             <div className="alert error" role="alert">
               {error}

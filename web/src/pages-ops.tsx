@@ -1,4 +1,5 @@
 import { FormEvent, useEffect, useMemo, useState } from "react";
+import { QRCodeCanvas } from "qrcode.react";
 import { useSearchParams } from "react-router-dom";
 import {
   AuditEvent,
@@ -6,6 +7,8 @@ import {
   Instance,
   StorageOverview,
   Token,
+  TotpSetup,
+  TotpStatus,
   UploadSession,
   User,
   Webhook,
@@ -22,6 +25,7 @@ import {
   ErrorState,
   HealthDot,
   Metric,
+  Modal,
   PageHeader,
   RelativeTime,
   RepositoryName,
@@ -471,6 +475,119 @@ export function WebhooksPage({ admin }: { admin: boolean }) {
 }
 
 export function SecuritySettingsPage({ user }: { user: User }) {
+  const toast = useToast();
+  const [status, setStatus] = useState<TotpStatus | null>(null);
+  const [loadError, setLoadError] = useState("");
+  const [passwords, setPasswords] = useState({ current: "", next: "", confirm: "" });
+  const [passwordBusy, setPasswordBusy] = useState(false);
+  const [passwordError, setPasswordError] = useState("");
+  const [setupOpen, setSetupOpen] = useState(false);
+  const [setup, setSetup] = useState<TotpSetup | null>(null);
+  const [setupPassword, setSetupPassword] = useState("");
+  const [setupCode, setSetupCode] = useState("");
+  const [setupBusy, setSetupBusy] = useState(false);
+  const [setupError, setSetupError] = useState("");
+  const [disableOpen, setDisableOpen] = useState(false);
+  const [disablePassword, setDisablePassword] = useState("");
+  const [disableCode, setDisableCode] = useState("");
+  const [disableBusy, setDisableBusy] = useState(false);
+  const [disableError, setDisableError] = useState("");
+
+  function loadStatus() {
+    setLoadError("");
+    api<TotpStatus>("/api/v1/auth/2fa")
+      .then(setStatus)
+      .catch((reason) => setLoadError(friendlyError(reason)));
+  }
+  useEffect(loadStatus, []);
+
+  async function changePassword(event: FormEvent) {
+    event.preventDefault();
+    setPasswordBusy(true);
+    setPasswordError("");
+    try {
+      await api("/api/v1/auth/password", {
+        method: "POST",
+        body: JSON.stringify({
+          current_password: passwords.current,
+          new_password: passwords.next,
+          confirm_password: passwords.confirm
+        })
+      });
+      setPasswords({ current: "", next: "", confirm: "" });
+      toast("Password changed. Other sessions were signed out.");
+    } catch (reason) {
+      setPasswordError(friendlyError(reason));
+    } finally {
+      setPasswordBusy(false);
+    }
+  }
+
+  function closeSetup() {
+    setSetupOpen(false);
+    setSetup(null);
+    setSetupPassword("");
+    setSetupCode("");
+    setSetupError("");
+  }
+
+  async function startSetup(event: FormEvent) {
+    event.preventDefault();
+    setSetupBusy(true);
+    setSetupError("");
+    try {
+      const result = await api<TotpSetup>("/api/v1/auth/2fa/setup", {
+        method: "POST",
+        body: JSON.stringify({ password: setupPassword })
+      });
+      setSetup(result);
+    } catch (reason) {
+      setSetupError(friendlyError(reason));
+    } finally {
+      setSetupBusy(false);
+    }
+  }
+
+  async function confirmSetup(event: FormEvent) {
+    event.preventDefault();
+    setSetupBusy(true);
+    setSetupError("");
+    try {
+      await api<TotpStatus>("/api/v1/auth/2fa/confirm", {
+        method: "POST",
+        body: JSON.stringify({ code: setupCode })
+      });
+      setStatus({ enabled: true });
+      closeSetup();
+      toast("Two-factor authentication enabled");
+    } catch (reason) {
+      setSetupError(friendlyError(reason));
+    } finally {
+      setSetupBusy(false);
+    }
+  }
+
+  async function disableTwoFactor(event: FormEvent) {
+    event.preventDefault();
+    setDisableBusy(true);
+    setDisableError("");
+    try {
+      await api<TotpStatus>("/api/v1/auth/2fa/disable", {
+        method: "POST",
+        body: JSON.stringify({ password: disablePassword, code: disableCode })
+      });
+      setStatus({ enabled: false });
+      setDisableOpen(false);
+      setDisablePassword("");
+      setDisableCode("");
+      toast("Two-factor authentication disabled");
+    } catch (reason) {
+      setDisableError(friendlyError(reason));
+    } finally {
+      setDisableBusy(false);
+    }
+  }
+
   return (
     <>
       <PageHeader title="Account security" description="Password, sessions, and two-factor authentication." />
@@ -483,22 +600,45 @@ export function SecuritySettingsPage({ user }: { user: User }) {
               <div style={{ color: "var(--muted)" }}>{user.is_admin ? "Administrator" : "Member"}</div>
             </div>
           </div>
-          <div className="health-row">
-            <div>
-              <strong>Password</strong>
-              <div style={{ color: "var(--muted)", fontSize: 13 }}>Use a unique password for this browser session.</div>
-            </div>
-            <button className="btn" disabled>
-              Change
-            </button>
+          <div>
+            <strong>Password</strong>
+            <div style={{ color: "var(--muted)", fontSize: 13, marginTop: 4 }}>Changing it signs out all other browser sessions.</div>
           </div>
+          <form className="stack" onSubmit={changePassword}>
+            <label className="field">
+              <span>Current password</span>
+              <input type="password" autoComplete="current-password" value={passwords.current} onChange={(event) => setPasswords({ ...passwords, current: event.target.value })} required />
+            </label>
+            <label className="field">
+              <span>New password</span>
+              <input type="password" autoComplete="new-password" minLength={12} value={passwords.next} onChange={(event) => setPasswords({ ...passwords, next: event.target.value })} required />
+            </label>
+            <label className="field">
+              <span>Confirm new password</span>
+              <input type="password" autoComplete="new-password" minLength={12} value={passwords.confirm} onChange={(event) => setPasswords({ ...passwords, confirm: event.target.value })} required />
+            </label>
+            {passwordError && <div className="alert error" role="alert">{passwordError}</div>}
+            <button className="btn primary" disabled={passwordBusy}>
+              {passwordBusy ? "Changing…" : "Change password"}
+            </button>
+          </form>
           <div className="health-row">
             <div>
               <strong>Two-factor authentication</strong>
-              <div style={{ color: "var(--muted)", fontSize: 13 }}>Add an extra layer of security to your account.</div>
+              <div style={{ color: "var(--muted)", fontSize: 13 }}>Use an authenticator app for an extra sign-in challenge.</div>
             </div>
-            <StatusBadge state="neutral" label="Not configured" />
+            {status?.enabled ? <StatusBadge state="ok" label="Enabled" /> : <StatusBadge state="neutral" label="Not configured" />}
           </div>
+          {loadError && <div className="alert error" role="alert">{loadError}</div>}
+          {status?.enabled ? (
+            <button className="btn danger" onClick={() => { setDisableError(""); setDisableOpen(true); }}>
+              Disable two-factor authentication
+            </button>
+          ) : (
+            <button className="btn" onClick={() => { setSetupError(""); setSetupOpen(true); }}>
+              Set up authenticator app
+            </button>
+          )}
         </section>
         <section className="panel panel-pad grid-gap">
           <h2>Active sessions</h2>
@@ -512,6 +652,66 @@ export function SecuritySettingsPage({ user }: { user: User }) {
           <p style={{ color: "var(--muted)", fontSize: 13 }}>Remote session listing is not exposed by this control plane. Sign out to invalidate this cookie.</p>
         </section>
       </div>
+      {setupOpen && (
+        <Modal
+          title={setup ? "Confirm authenticator setup" : "Set up authenticator app"}
+          onClose={closeSetup}
+          wide
+          footer={
+            <>
+              <button className="btn ghost" onClick={closeSetup}>Cancel</button>
+              {!setup ? (
+                <button className="btn primary" form="totp-start" disabled={setupBusy}>{setupBusy ? "Preparing…" : "Continue"}</button>
+              ) : (
+                <button className="btn primary" form="totp-confirm" disabled={setupBusy || setupCode.length !== 6}>{setupBusy ? "Verifying…" : "Enable 2FA"}</button>
+              )}
+            </>
+          }
+        >
+          {!setup ? (
+            <form id="totp-start" className="stack" onSubmit={startSetup}>
+              <p>Confirm your current password to generate a one-time setup secret.</p>
+              <label className="field">
+                <span>Current password</span>
+                <input autoFocus type="password" autoComplete="current-password" value={setupPassword} onChange={(event) => setSetupPassword(event.target.value)} required />
+              </label>
+              {setupError && <div className="alert error" role="alert">{setupError}</div>}
+            </form>
+          ) : (
+            <form id="totp-confirm" className="stack" onSubmit={confirmSetup}>
+              <div className="totp-setup">
+                <div className="qr-panel"><QRCodeCanvas value={setup.otpauth_uri} size={184} includeMargin /></div>
+                <div className="stack">
+                  <p>Scan this QR code in Google Authenticator, 1Password, Authy or another TOTP app.</p>
+                  <div className="secret-box mono">{setup.secret}</div>
+                  <CopyButton value={setup.secret} label="Copy secret" />
+                  <details className="details">
+                    <summary>Show setup URI</summary>
+                    <div className="secret-box mono">{setup.otpauth_uri}</div>
+                    <CopyButton value={setup.otpauth_uri} label="Copy URI" />
+                  </details>
+                </div>
+              </div>
+              <label className="field">
+                <span>Authenticator code</span>
+                <input autoFocus inputMode="numeric" autoComplete="one-time-code" maxLength={6} pattern="[0-9]{6}" value={setupCode} onChange={(event) => setSetupCode(event.target.value.replace(/\D/g, "").slice(0, 6))} placeholder="000000" required />
+                <small>Enter the current 6-digit code to finish setup.</small>
+              </label>
+              {setupError && <div className="alert error" role="alert">{setupError}</div>}
+            </form>
+          )}
+        </Modal>
+      )}
+      {disableOpen && (
+        <Modal title="Disable two-factor authentication" onClose={() => !disableBusy && setDisableOpen(false)} footer={<><button className="btn ghost" onClick={() => setDisableOpen(false)}>Cancel</button><button className="btn danger solid" form="totp-disable" disabled={disableBusy || disableCode.length !== 6}>{disableBusy ? "Disabling…" : "Disable 2FA"}</button></>}>
+          <form id="totp-disable" className="stack" onSubmit={disableTwoFactor}>
+            <div className="alert warn">You will only need your password to sign in after this change.</div>
+            <label className="field"><span>Current password</span><input autoFocus type="password" autoComplete="current-password" value={disablePassword} onChange={(event) => setDisablePassword(event.target.value)} required /></label>
+            <label className="field"><span>Authenticator code</span><input inputMode="numeric" autoComplete="one-time-code" maxLength={6} pattern="[0-9]{6}" value={disableCode} onChange={(event) => setDisableCode(event.target.value.replace(/\D/g, "").slice(0, 6))} required /></label>
+            {disableError && <div className="alert error" role="alert">{disableError}</div>}
+          </form>
+        </Modal>
+      )}
     </>
   );
 }

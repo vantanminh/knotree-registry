@@ -16,9 +16,14 @@ The Vite development server proxies `/api`, `/auth`, and `/v2` to `http://127.0.
 
 | Endpoint | Purpose |
 | --- | --- |
-| `POST /api/v1/auth/login` | Create a browser session from the bootstrap username/password. |
+| `POST /api/v1/auth/login` | Create a browser session from the bootstrap username/password; include the six-digit `otp` value when TOTP is enabled. |
 | `POST /api/v1/auth/logout` | Revoke the current browser session. |
 | `GET /api/v1/auth/me` | Return the current user summary. |
+| `POST /api/v1/auth/password` | Change the current user password; requires the current password and confirmation, then rotates the browser session. |
+| `GET /api/v1/auth/2fa` | Return whether authenticator-app TOTP is enabled. |
+| `POST /api/v1/auth/2fa/setup` | Verify the current password and start TOTP setup; returns the one-time setup secret and `otpauth://` URI. |
+| `POST /api/v1/auth/2fa/confirm` | Confirm a six-digit authenticator-app code and enable TOTP. |
+| `POST /api/v1/auth/2fa/disable` | Disable TOTP after verifying the current password and authenticator-app code. |
 | `GET /api/v1/overview` | Return the current user, repository count, repository names, and active credential count. |
 | `GET /api/v1/repositories` | List private repositories visible to the current session. |
 | `GET /api/v1/repositories/{name}` | Return tag, digest, media type, size, and creation metadata. Nested names retain their `/` separator. |
@@ -33,4 +38,4 @@ The Vite development server proxies `/api`, `/auth`, and `/v2` to `http://127.0.
 
 Credential secrets are never returned by list endpoints. Action scopes are `pull`, `push`, `delete`, and `admin`; requested scopes are checked against the logged-in user’s credential before they reach the Docker Bearer token service.
 
-The current dashboard covers sign-in, overview, repository browsing, one-time token reveal/revoke, and security guidance. Audit and webhook controls are available through the documented control-plane API; they remain separate from the `/v2` protocol so browser cookies never authorize registry requests.
+The current dashboard covers sign-in, overview, repository browsing, one-time token reveal/revoke, password changes, and authenticator-app TOTP setup/disable. Audit and webhook controls are available through the documented control-plane API; they remain separate from the `/v2` protocol so browser cookies never authorize registry requests.

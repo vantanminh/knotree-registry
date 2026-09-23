@@ -31,23 +31,43 @@ impl IntoResponse for AppError {
             | Self::Auth(registry_auth::AuthError::InvalidSession)
             | Self::Auth(registry_auth::AuthError::CredentialRevoked)
             | Self::Auth(registry_auth::AuthError::CredentialExpired)
-            | Self::Auth(registry_auth::AuthError::Bearer) => StatusCode::UNAUTHORIZED,
+            | Self::Auth(registry_auth::AuthError::Bearer)
+            | Self::Auth(registry_auth::AuthError::TwoFactorRequired)
+            | Self::Auth(registry_auth::AuthError::InvalidTwoFactorCode) => {
+                StatusCode::UNAUTHORIZED
+            }
             Self::Auth(registry_auth::AuthError::NoAccess) => StatusCode::FORBIDDEN,
+            Self::Auth(registry_auth::AuthError::TwoFactorAlreadyEnabled) => StatusCode::CONFLICT,
+            Self::Auth(
+                registry_auth::AuthError::TwoFactorNotEnabled
+                | registry_auth::AuthError::TwoFactorSetupMissing
+                | registry_auth::AuthError::WeakPassword
+                | registry_auth::AuthError::InvalidScope,
+            )
+            | Self::BadRequest(_) => StatusCode::BAD_REQUEST,
             Self::Catalog(crate::CatalogError::NotFound) => StatusCode::NOT_FOUND,
             Self::Catalog(crate::CatalogError::InvalidTag)
             | Self::Catalog(crate::CatalogError::Manifest(_)) => StatusCode::BAD_REQUEST,
-            Self::BadRequest(_) | Self::Auth(registry_auth::AuthError::InvalidScope) => {
-                StatusCode::BAD_REQUEST
-            }
             _ => StatusCode::INTERNAL_SERVER_ERROR,
         };
         if status != StatusCode::INTERNAL_SERVER_ERROR {
-            let error = if status == StatusCode::FORBIDDEN {
-                "forbidden"
-            } else if status == StatusCode::BAD_REQUEST {
-                "bad_request"
-            } else {
-                "unauthorized"
+            let error = match &self {
+                Self::Auth(registry_auth::AuthError::TwoFactorRequired) => "two_factor_required",
+                Self::Auth(registry_auth::AuthError::InvalidTwoFactorCode) => "two_factor_invalid",
+                Self::Auth(registry_auth::AuthError::WeakPassword) => "weak_password",
+                Self::Auth(registry_auth::AuthError::TwoFactorAlreadyEnabled) => {
+                    "two_factor_already_enabled"
+                }
+                Self::Auth(registry_auth::AuthError::TwoFactorNotEnabled) => {
+                    "two_factor_not_enabled"
+                }
+                Self::Auth(registry_auth::AuthError::TwoFactorSetupMissing) => {
+                    "two_factor_setup_missing"
+                }
+                Self::BadRequest("passwords do not match") => "password_mismatch",
+                _ if status == StatusCode::FORBIDDEN => "forbidden",
+                _ if status == StatusCode::BAD_REQUEST => "bad_request",
+                _ => "unauthorized",
             };
             return (status, Json(json!({"error": error}))).into_response();
         }

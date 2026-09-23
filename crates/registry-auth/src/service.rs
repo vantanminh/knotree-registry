@@ -15,12 +15,23 @@ use uuid::Uuid;
 use crate::{
     jwt::{AccessEntry, JwtIssuer, RegistryClaims, now_seconds},
     secret::{SecretVerifier, issue_secret, raw_digest},
+    totp,
 };
 
 #[derive(Debug, Error)]
 pub enum AuthError {
     #[error("invalid credentials")]
     InvalidCredentials,
+    #[error("two-factor authentication is required")]
+    TwoFactorRequired,
+    #[error("invalid two-factor authentication code")]
+    InvalidTwoFactorCode,
+    #[error("two-factor authentication is already enabled")]
+    TwoFactorAlreadyEnabled,
+    #[error("two-factor authentication is not enabled")]
+    TwoFactorNotEnabled,
+    #[error("two-factor setup has not been started")]
+    TwoFactorSetupMissing,
     #[error("invalid session")]
     InvalidSession,
     #[error("bootstrap admin already exists")]
@@ -93,6 +104,17 @@ pub struct MintedToken {
     pub issued_at: u64,
 }
 
+#[derive(Debug, Clone, Serialize)]
+pub struct TotpSetup {
+    pub secret: String,
+    pub otpauth_uri: String,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct TotpStatus {
+    pub enabled: bool,
+}
+
 #[derive(Clone)]
 pub struct AuthService {
     state: std::sync::Arc<tokio::sync::RwLock<AuthState>>,
@@ -116,6 +138,10 @@ struct UserRecord {
     username: String,
     password_hash: String,
     is_admin: bool,
+    #[serde(default)]
+    totp_secret: Option<String>,
+    #[serde(default)]
+    totp_pending_secret: Option<String>,
 }
 
 #[derive(Clone, Serialize, Deserialize)]
@@ -279,6 +305,8 @@ impl AuthService {
             username: username.to_owned(),
             password_hash,
             is_admin: true,
+            totp_secret: None,
+            totp_pending_secret: None,
         };
         let summary = summary(&user);
         state.users.insert(user.username.clone(), user);
@@ -286,6 +314,15 @@ impl AuthService {
     }
 
     pub async fn login(&self, username: &str, password: &str) -> Result<Session, AuthError> {
+        self.login_with_totp(username, password, None).await
+    }
+
+    pub async fn login_with_totp(
+        &self,
+        username: &str,
+        password: &str,
+        code: Option<&str>,
+    ) -> Result<Session, AuthError> {
         let now = now_seconds();
         let user = {
             let state = self.state.read().await;
@@ -304,22 +341,184 @@ impl AuthService {
         if verify_password(&user.password_hash, password).is_err() {
             return Err(self.failed_login(username).await);
         }
-        self.state.write().await.login_attempts.remove(username);
-        let (token, _, _) = issue_secret("kntr_session_");
-        let expires_at = now_seconds().saturating_add(8 * 60 * 60);
-        self.state.write().await.sessions.insert(
-            raw_digest(&token),
-            SessionRecord {
-                user_id: user.id,
-                expires_at,
-                revoked: false,
-            },
-        );
-        Ok(Session {
-            token,
-            user: summary(&user),
-            expires_at,
+        if let Some(secret) = user.totp_secret.as_deref() {
+            let Some(code) = code else {
+                return Err(AuthError::TwoFactorRequired);
+            };
+            if !totp::verify(secret, code, now) {
+                let _ = self.failed_login(username).await;
+                return Err(AuthError::InvalidTwoFactorCode);
+            }
+        }
+        let mut state = self.state.write().await;
+        state.login_attempts.remove(username);
+        Ok(issue_session(&mut state, &user))
+    }
+
+    pub async fn change_password(
+        &self,
+        session_token: &str,
+        current_password: &str,
+        new_password: &str,
+    ) -> Result<Session, AuthError> {
+        let user_id = self.session_user_id(session_token).await?;
+        let user = self
+            .state
+            .read()
+            .await
+            .users
+            .values()
+            .find(|user| user.id == user_id)
+            .cloned()
+            .ok_or(AuthError::InvalidSession)?;
+        verify_password(&user.password_hash, current_password)?;
+        let password_hash = hash_password(new_password)?;
+        let mut state = self.state.write().await;
+        let updated = state
+            .users
+            .get_mut(&user.username)
+            .ok_or(AuthError::InvalidSession)?;
+        updated.password_hash = password_hash;
+        for session in state.sessions.values_mut() {
+            if session.user_id == user_id {
+                session.revoked = true;
+            }
+        }
+        let updated = state
+            .users
+            .get(&user.username)
+            .cloned()
+            .ok_or(AuthError::InvalidSession)?;
+        Ok(issue_session(&mut state, &updated))
+    }
+
+    pub async fn totp_status(&self, session_token: &str) -> Result<TotpStatus, AuthError> {
+        let user_id = self.session_user_id(session_token).await?;
+        let state = self.state.read().await;
+        let user = state
+            .users
+            .values()
+            .find(|user| user.id == user_id)
+            .ok_or(AuthError::InvalidSession)?;
+        Ok(TotpStatus {
+            enabled: user.totp_secret.is_some(),
         })
+    }
+
+    pub async fn begin_totp_setup(
+        &self,
+        session_token: &str,
+        password: &str,
+    ) -> Result<TotpSetup, AuthError> {
+        let user_id = self.session_user_id(session_token).await?;
+        let user = self
+            .state
+            .read()
+            .await
+            .users
+            .values()
+            .find(|user| user.id == user_id)
+            .cloned()
+            .ok_or(AuthError::InvalidSession)?;
+        verify_password(&user.password_hash, password)?;
+        let mut state = self.state.write().await;
+        let user = state
+            .users
+            .values()
+            .find(|user| user.id == user_id)
+            .cloned()
+            .ok_or(AuthError::InvalidSession)?;
+        if user.totp_secret.is_some() {
+            return Err(AuthError::TwoFactorAlreadyEnabled);
+        }
+        let secret = totp::generate_secret();
+        let user = state
+            .users
+            .get_mut(&user.username)
+            .ok_or(AuthError::InvalidSession)?;
+        user.totp_pending_secret = Some(secret.clone());
+        Ok(TotpSetup {
+            otpauth_uri: totp::otpauth_uri(&self.issuer_name, &user.username, &secret),
+            secret,
+        })
+    }
+
+    pub async fn confirm_totp_setup(
+        &self,
+        session_token: &str,
+        code: &str,
+    ) -> Result<TotpStatus, AuthError> {
+        let user_id = self.session_user_id(session_token).await?;
+        let digest = raw_digest(session_token);
+        let mut state = self.state.write().await;
+        let user = state
+            .users
+            .values()
+            .find(|user| user.id == user_id)
+            .cloned()
+            .ok_or(AuthError::InvalidSession)?;
+        let secret = user
+            .totp_pending_secret
+            .as_deref()
+            .ok_or(AuthError::TwoFactorSetupMissing)?;
+        if !totp::verify(secret, code, now_seconds()) {
+            return Err(AuthError::InvalidTwoFactorCode);
+        }
+        let user = state
+            .users
+            .get_mut(&user.username)
+            .ok_or(AuthError::InvalidSession)?;
+        user.totp_secret = Some(secret.to_owned());
+        user.totp_pending_secret = None;
+        for (session_digest, session) in &mut state.sessions {
+            if session.user_id == user_id && session_digest != &digest {
+                session.revoked = true;
+            }
+        }
+        Ok(TotpStatus { enabled: true })
+    }
+
+    pub async fn disable_totp(
+        &self,
+        session_token: &str,
+        password: &str,
+        code: &str,
+    ) -> Result<TotpStatus, AuthError> {
+        let user_id = self.session_user_id(session_token).await?;
+        let user = self
+            .state
+            .read()
+            .await
+            .users
+            .values()
+            .find(|user| user.id == user_id)
+            .cloned()
+            .ok_or(AuthError::InvalidSession)?;
+        verify_password(&user.password_hash, password)?;
+        let secret = user
+            .totp_secret
+            .as_deref()
+            .ok_or(AuthError::TwoFactorNotEnabled)?;
+        if !totp::verify(secret, code, now_seconds()) {
+            return Err(AuthError::InvalidTwoFactorCode);
+        }
+        let mut state = self.state.write().await;
+        let user = state
+            .users
+            .values()
+            .find(|user| user.id == user_id)
+            .cloned()
+            .ok_or(AuthError::InvalidSession)?;
+        if user.totp_secret.is_none() {
+            return Err(AuthError::TwoFactorNotEnabled);
+        }
+        let user = state
+            .users
+            .get_mut(&user.username)
+            .ok_or(AuthError::InvalidSession)?;
+        user.totp_secret = None;
+        user.totp_pending_secret = None;
+        Ok(TotpStatus { enabled: false })
     }
 
     pub async fn logout(&self, session_token: &str) -> Result<(), AuthError> {
@@ -400,23 +599,21 @@ impl AuthService {
             revoked_at: None,
             last_used_at: None,
         };
-        let result = CredentialCreated {
-            id: credential.id,
+        let id = credential.id;
+        let mut state = self.state.write().await;
+        if !state.users.values().any(|user| user.id == user_id) {
+            return Err(AuthError::InvalidSession);
+        }
+        state.credential_prefixes.insert(prefix.clone(), id);
+        state.credentials.insert(id, credential);
+        Ok(CredentialCreated {
+            id,
             name,
             prefix,
             secret,
             scopes,
             expires_at,
-        };
-        let mut state = self.state.write().await;
-        if !state.users.values().any(|user| user.id == user_id) {
-            return Err(AuthError::InvalidCredentials);
-        }
-        state
-            .credential_prefixes
-            .insert(credential.prefix.clone(), credential.id);
-        state.credentials.insert(credential.id, credential);
-        Ok(result)
+        })
     }
 
     pub async fn revoke_credential(&self, id: Uuid) -> Result<(), AuthError> {
@@ -677,6 +874,24 @@ fn summary(user: &UserRecord) -> UserSummary {
     }
 }
 
+fn issue_session(state: &mut AuthState, user: &UserRecord) -> Session {
+    let (token, _, _) = issue_secret("kntr_session_");
+    let expires_at = now_seconds().saturating_add(8 * 60 * 60);
+    state.sessions.insert(
+        raw_digest(&token),
+        SessionRecord {
+            user_id: user.id,
+            expires_at,
+            revoked: false,
+        },
+    );
+    Session {
+        token,
+        user: summary(user),
+        expires_at,
+    }
+}
+
 fn validate_username(username: &str) -> Result<(), AuthError> {
     if !(3..=64).contains(&username.len())
         || username != username.to_ascii_lowercase()
@@ -796,6 +1011,113 @@ mod tests {
         let attempt = state.login_attempts.get("admin").expect("login attempt");
         assert_eq!(attempt.failures, 5);
         assert!(attempt.blocked_until > now_seconds());
+    }
+
+    #[tokio::test]
+    async fn password_change_requires_current_password_and_rotates_sessions() {
+        let auth = AuthService::new("knotree-registry", "knotree-registry", 300);
+        auth.bootstrap_admin("admin", "correct horse battery staple")
+            .await
+            .expect("bootstrap");
+        let old_session = auth
+            .login("admin", "correct horse battery staple")
+            .await
+            .expect("login");
+        let new_session = auth
+            .change_password(
+                &old_session.token,
+                "correct horse battery staple",
+                "a different secure password",
+            )
+            .await
+            .expect("change password");
+        assert!(matches!(
+            auth.session_user(&old_session.token).await,
+            Err(AuthError::InvalidSession)
+        ));
+        assert!(matches!(
+            auth.login("admin", "correct horse battery staple").await,
+            Err(AuthError::InvalidCredentials)
+        ));
+        assert_eq!(
+            auth.login("admin", "a different secure password")
+                .await
+                .expect("new password")
+                .user
+                .id,
+            new_session.user.id
+        );
+    }
+
+    #[tokio::test]
+    async fn totp_setup_requires_confirmation_and_gates_login() {
+        let auth = AuthService::new("knotree-registry", "knotree-registry", 300);
+        auth.bootstrap_admin("admin", "correct horse battery staple")
+            .await
+            .expect("bootstrap");
+        let session = auth
+            .login("admin", "correct horse battery staple")
+            .await
+            .expect("login");
+        let setup = auth
+            .begin_totp_setup(&session.token, "correct horse battery staple")
+            .await
+            .expect("begin setup");
+        assert!(
+            !auth
+                .totp_status(&session.token)
+                .await
+                .expect("status")
+                .enabled
+        );
+        assert!(matches!(
+            auth.confirm_totp_setup(&session.token, "000000").await,
+            Err(AuthError::InvalidTwoFactorCode)
+        ));
+        assert!(
+            auth.login("admin", "correct horse battery staple")
+                .await
+                .is_ok()
+        );
+        let code = crate::totp::code_for_test(&setup.secret, now_seconds() / 30);
+        assert!(
+            auth.confirm_totp_setup(&session.token, &code)
+                .await
+                .expect("confirm")
+                .enabled
+        );
+        assert!(matches!(
+            auth.login("admin", "correct horse battery staple").await,
+            Err(AuthError::TwoFactorRequired)
+        ));
+        let code = crate::totp::code_for_test(&setup.secret, now_seconds() / 30);
+        assert!(
+            auth.login_with_totp("admin", "correct horse battery staple", Some(&code))
+                .await
+                .is_ok()
+        );
+        let restored = AuthService::from_snapshot(
+            "knotree-registry",
+            "knotree-registry",
+            300,
+            auth.snapshot().await.expect("snapshot"),
+        )
+        .expect("restore");
+        assert!(
+            restored
+                .totp_status(&session.token)
+                .await
+                .expect("status")
+                .enabled
+        );
+        let code = crate::totp::code_for_test(&setup.secret, now_seconds() / 30);
+        assert!(
+            !restored
+                .disable_totp(&session.token, "correct horse battery staple", &code)
+                .await
+                .expect("disable")
+                .enabled
+        );
     }
 
     #[tokio::test]

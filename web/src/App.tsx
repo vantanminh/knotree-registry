@@ -254,7 +254,7 @@ function Shell() {
           <button className="btn icon ghost menu-toggle" onClick={() => setMenuOpen(true)} aria-label="Open navigation">
             <Menu size={16} />
           </button>
-          <button className="btn icon ghost" onClick={() => setCollapsed(!collapsed)} aria-label="Collapse sidebar">
+          <button className="btn icon ghost sidebar-toggle" onClick={() => setCollapsed(!collapsed)} aria-label="Collapse sidebar">
             {collapsed ? <ChevronRight size={16} /> : <ChevronLeft size={16} />}
           </button>
           <nav className="crumbs" aria-label="Breadcrumb">

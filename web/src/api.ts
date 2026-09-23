@@ -1,4 +1,6 @@
 export type User = { id: string; username: string; is_admin: boolean };
+export type TotpStatus = { enabled: boolean };
+export type TotpSetup = { secret: string; otpauth_uri: string };
 export type Scope = { repository: string; actions: string[] };
 export type Token = {
   id: string;
@@ -113,6 +115,13 @@ export async function api<T>(path: string, init: RequestInit = {}): Promise<T> {
 
 export function friendlyError(error: unknown): string {
   const apiError = error as ApiError;
+  if (apiError.code === "two_factor_required") return "Enter the code from your authenticator app to continue.";
+  if (apiError.code === "two_factor_invalid") return "The authenticator code is invalid or expired.";
+  if (apiError.code === "weak_password") return "Use a password with at least 12 characters.";
+  if (apiError.code === "password_mismatch") return "The new passwords do not match.";
+  if (apiError.code === "two_factor_already_enabled") return "Two-factor authentication is already enabled.";
+  if (apiError.code === "two_factor_not_enabled") return "Two-factor authentication is not enabled.";
+  if (apiError.code === "two_factor_setup_missing") return "Start two-factor setup before confirming a code.";
   if (apiError.status === 401) return "Your session expired. Sign in again to continue.";
   if (apiError.status === 403) return "You don't have permission to access this page.";
   if (apiError.status === 404) return "The requested resource was not found.";
