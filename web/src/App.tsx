@@ -62,7 +62,7 @@ const nav: { label: string; items: NavItem[] }[] = [
     label: "Operations",
     items: [
       { to: "/activity", label: "Activity", icon: Activity },
-      { to: "/operations/webhooks", label: "Webhooks", icon: Webhook },
+      { to: "/operations/webhooks", label: "Webhooks", icon: Webhook, admin: true },
       { to: "/operations/storage", label: "Storage", icon: HardDrive },
       { to: "/operations/garbage-collection", label: "Garbage Collection", icon: Trash2, admin: true }
     ]

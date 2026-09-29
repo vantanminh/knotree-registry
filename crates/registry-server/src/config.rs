@@ -24,6 +24,7 @@ pub enum PullMode {
 
 #[derive(Debug, Clone)]
 pub struct AppConfig {
+    pub sso: Option<crate::sso::SsoConfig>,
     pub environment: AppEnvironment,
     pub bind_addr: SocketAddr,
     pub public_url: String,
@@ -54,6 +55,8 @@ pub struct AppConfig {
 
 #[derive(Debug, Error)]
 pub enum ConfigError {
+    #[error("invalid Accounts SSO configuration: {0}")]
+    Sso(&'static str),
     #[error("invalid BIND_ADDR: {0}")]
     BindAddr(#[from] std::net::AddrParseError),
     #[error("invalid {0}: {1}")]
@@ -178,6 +181,7 @@ impl AppConfig {
             .map(str::to_owned)
             .collect();
         let config = Self {
+            sso: crate::sso::SsoConfig::from_env(environment)?,
             environment,
             bind_addr,
             public_url,
@@ -210,6 +214,9 @@ impl AppConfig {
     }
 
     pub fn validate(&self) -> Result<(), ConfigError> {
+        if let Some(sso) = &self.sso {
+            sso.validate(self.environment == AppEnvironment::Production)?;
+        }
         let Ok(public_url) = url::Url::parse(&self.public_url) else {
             return Err(ConfigError::PublicUrl);
         };
@@ -318,6 +325,7 @@ mod tests {
 
     fn config() -> AppConfig {
         AppConfig {
+            sso: None,
             environment: AppEnvironment::Development,
             bind_addr: "127.0.0.1:8080".parse().expect("address"),
             public_url: "http://localhost:8080".to_owned(),

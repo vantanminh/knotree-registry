@@ -3,6 +3,7 @@ mod config;
 mod error;
 mod metrics;
 mod routes;
+mod sso;
 mod state;
 mod uploads;
 
@@ -20,3 +21,5 @@ pub use uploads::{FinalizedUpload, UploadError, UploadManager, UploadStatus, Upl
 pub async fn build_state(config: AppConfig) -> Result<AppState, AppError> {
     AppState::initialize(config).await
 }
+
+pub use sso::SsoConfig;

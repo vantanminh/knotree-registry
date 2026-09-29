@@ -62,5 +62,15 @@ checks enforce this namespace, including denial of instance/admin scopes.
 The control plane filters repository inventory and audit events for these
 users and keeps global webhook/upload/GC operations restricted to admins.
 The existing bootstrap admin and its repositories remain under operator
-control. OAuth login routes and Cloud authorization are still being integrated;
-these primitives alone do not enable SSO in production.
+control. Accounts login is available through `/api/v1/auth/sso/start` and its
+server-side callback when `SSO_ENABLED=true`. The login screen checks
+`/api/v1/auth/sso/config` before offering central sign-in. Set `SSO_ISSUER`,
+`SSO_CLIENT_ID=knotree-registry` and `SSO_REDIRECT_URI` only after Accounts
+and the exact callback are ready. The API uses browser-bound single-use state,
+S256 PKCE and verified live userinfo from the pinned issuer, then persists a
+local session. Tokens and authorization codes are not written to logs.
+Pending login requests are memory-only and expire after ten minutes; restart
+sign-in after a Registry process restart. Central SSO is disabled by default.
+
+Cloud authorization and live end-to-end verification are still pending;
+these code changes do not prove production SSO is active.

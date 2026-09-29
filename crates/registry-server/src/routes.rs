@@ -45,6 +45,9 @@ pub fn router(state: AppState) -> Router {
         .route("/v2/", get(distribution_version))
         .route("/v2/{*path}", any(oci_route))
         .route("/auth/token", get(token))
+        .route("/api/v1/auth/sso/config", get(crate::sso::configuration))
+        .route("/api/v1/auth/sso/start", get(crate::sso::start))
+        .route("/api/v1/auth/sso/callback", get(crate::sso::callback))
         .route("/api/v1/auth/login", post(login))
         .route("/api/v1/auth/logout", post(logout))
         .route("/api/v1/auth/me", get(me))
@@ -87,7 +90,9 @@ pub fn router(state: AppState) -> Router {
             metrics_middleware,
         ))
         .layer(middleware::from_fn(request_id))
-        .layer(TraceLayer::new_for_http())
+        .layer(TraceLayer::new_for_http().make_span_with(|request: &Request<Body>| {
+            tracing::info_span!("http", method = %request.method(), path = request.uri().path())
+        }))
 }
 
 async fn persistence_middleware(
@@ -1398,7 +1403,7 @@ async fn user_inventory(
             .repositories
             .iter()
             .map(|repository| repository.size)
-            .sum();
+            .fold(0, u64::saturating_add);
         inventory.referenced_bytes = inventory.total_bytes;
         inventory.unreferenced_bytes = 0;
     }
@@ -1730,7 +1735,7 @@ fn cookie_value(headers: &HeaderMap) -> Option<&str> {
         .find_map(|part| part.trim().strip_prefix("kntr_session="))
 }
 
-fn session_cookie(state: &AppState, token: &str, expires_at: u64) -> HeaderValue {
+pub(crate) fn session_cookie(state: &AppState, token: &str, expires_at: u64) -> HeaderValue {
     let max_age = expires_at.saturating_sub(
         std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
@@ -1773,6 +1778,7 @@ mod tests {
     use registry_auth::parse_scope;
     use registry_core::{Digest, RepositoryName};
     use registry_events::WebhookSigner;
+    use sha2::Digest as _;
     use std::time::Duration;
     use tokio::{net::TcpListener, sync::mpsc, time::timeout};
     use tower::util::ServiceExt;
@@ -1830,8 +1836,122 @@ mod tests {
         assert_eq!(repositories[0]["name"], own.as_str());
     }
 
+    #[tokio::test]
+    async fn accounts_callback_uses_pkce_and_browser_binding_and_cannot_be_replayed() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let issuer = format!("http://{}", listener.local_addr().unwrap());
+        let expected = std::sync::Arc::new(std::sync::Mutex::new(String::new()));
+        let expected_for_server = expected.clone();
+        let provider=Router::new()
+            .route("/oauth/token",post(move |axum::extract::Form(form): axum::extract::Form<std::collections::HashMap<String,String>>| {
+                let expected=expected_for_server.lock().unwrap().clone();
+                async move {
+                    assert_eq!(form["client_id"],"knotree-registry");
+                    assert_eq!(form["grant_type"],"authorization_code");
+                    assert_eq!(base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(sha2::Sha256::digest(form["code_verifier"].as_bytes())),expected);
+                    Json(json!({"access_token":"provider-access-token","token_type":"Bearer"}))
+                }
+            }))
+            .route("/oauth/userinfo",get(|headers:HeaderMap|async move{
+                assert_eq!(headers.get(AUTHORIZATION).unwrap(),"Bearer provider-access-token");
+                Json(json!({"sub":"alice-sso-subject","email":"alice@example.com","email_verified":true}))
+            }));
+        let task = tokio::spawn(async move {
+            axum::serve(listener, provider).await.unwrap();
+        });
+        let mut config = test_config();
+        config.sso = Some(crate::SsoConfig {
+            issuer,
+            client_id: "knotree-registry".into(),
+            redirect_uri: "http://localhost:8080/api/v1/auth/sso/callback".into(),
+        });
+        let state = AppState::initialize(config).await.unwrap();
+        let app = router(state.clone());
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/api/v1/auth/sso/start")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::SEE_OTHER);
+        let url =
+            url::Url::parse(response.headers().get(LOCATION).unwrap().to_str().unwrap()).unwrap();
+        let params: std::collections::HashMap<String, String> = url
+            .query_pairs()
+            .map(|(k, v)| (k.into_owned(), v.into_owned()))
+            .collect();
+        assert_eq!(params["code_challenge_method"], "S256");
+        *expected.lock().unwrap() = params["code_challenge"].clone();
+        let cookie = response
+            .headers()
+            .get(SET_COOKIE)
+            .unwrap()
+            .to_str()
+            .unwrap()
+            .split(';')
+            .next()
+            .unwrap()
+            .to_owned();
+        let callback = format!(
+            "/api/v1/auth/sso/callback?state={}&code=valid-code",
+            params["state"]
+        );
+        let wrong = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri(&callback)
+                    .header(COOKIE, format!("kntr-sso={}", "0".repeat(64)))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(wrong.status(), StatusCode::UNAUTHORIZED);
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri(&callback)
+                    .header(COOKIE, &cookie)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::SEE_OTHER);
+        let session = response
+            .headers()
+            .get_all(SET_COOKIE)
+            .iter()
+            .find_map(|h| h.to_str().ok().filter(|v| v.starts_with("kntr_session=")))
+            .unwrap()
+            .split(';')
+            .next()
+            .unwrap();
+        let token = session.strip_prefix("kntr_session=").unwrap();
+        assert!(!state.auth.session_user(token).await.unwrap().is_admin);
+        let repeated = app
+            .oneshot(
+                Request::builder()
+                    .uri(callback)
+                    .header(COOKIE, cookie)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(repeated.status(), StatusCode::UNAUTHORIZED);
+        task.abort();
+    }
+
     fn test_config() -> AppConfig {
         AppConfig {
+            sso: None,
             environment: AppEnvironment::Development,
             bind_addr: "127.0.0.1:0".parse().expect("addr"),
             public_url: "http://localhost:8080".to_owned(),

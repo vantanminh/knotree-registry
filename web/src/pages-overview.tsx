@@ -264,6 +264,14 @@ export function LoginPage({
 }: {
   onLogin: () => void;
 }) {
+  const [ssoEnabled, setSsoEnabled] = useState(false);
+  useEffect(() => {
+    let active = true;
+    api<{ enabled: boolean }>("/api/v1/auth/sso/config")
+      .then((config) => { if (active) setSsoEnabled(config.enabled === true); })
+      .catch(() => { if (active) setSsoEnabled(false); });
+    return () => { active = false; };
+  }, []);
   const [username, setUsername] = useState("");
   const [password, setPassword] = useState("");
   const [otp, setOtp] = useState("");
@@ -293,6 +301,7 @@ export function LoginPage({
         <div className="brand-mark">K</div>
         <h1>Sign in</h1>
         <p className="lede">Knotree Registry</p>
+        {ssoEnabled && <a className="btn full" href="/api/v1/auth/sso/start">Continue with Knotree</a>}
         <form className="stack" onSubmit={submit}>
           <label className="field">
             <span>Username / Email</span>

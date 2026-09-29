@@ -29,6 +29,7 @@ struct RuntimeSnapshot {
 
 #[derive(Clone)]
 pub struct AppState {
+    pub(crate) sso_attempts: Arc<tokio::sync::Mutex<crate::sso::LoginAttempts>>,
     pub config: Arc<AppConfig>,
     pub store: DynObjectStore,
     pub database: Option<Database>,
@@ -156,6 +157,7 @@ impl AppState {
             None => WebhookRegistry::default(),
         };
         let state = Self {
+            sso_attempts: Arc::new(tokio::sync::Mutex::new(crate::sso::LoginAttempts::default())),
             config: Arc::new(config),
             store,
             database,
