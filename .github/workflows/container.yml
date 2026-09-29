@@ -79,6 +79,10 @@ jobs:
         KUBE_CONFIG: ${{ secrets.KUBE_CONFIG }}
         K8S_CONFIG_JSON: ${{ vars.K8S_CONFIG_JSON }}
         K8S_SECRETS_JSON: ${{ secrets.K8S_SECRETS_JSON }}
+        SSH_PRIVATE_KEY: ${{ secrets.SSH_PRIVATE_KEY }}
+        SSH_HOST: ${{ secrets.SSH_HOST }}
+        SSH_USER: ${{ secrets.SSH_USER }}
+        SSH_KNOWN_HOSTS: ${{ secrets.SSH_KNOWN_HOSTS }}
         IMAGE_DIGEST: ${{ needs.build-and-push.outputs.digest }}
         KNOTREE_REGISTRY_WEBHOOK_SECRET: ${{ secrets.KNOTREE_REGISTRY_WEBHOOK_SECRET }}
       run: bash deploy/ci/deliver.sh "ghcr.io/vantanminh/knotree-registry@$IMAGE_DIGEST"
