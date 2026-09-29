@@ -107,3 +107,19 @@ Do not set `STORAGE_BACKEND=r2` until `R2_ENDPOINT`, `R2_BUCKET`,
 `R2_ACCESS_KEY_ID`, and `R2_SECRET_ACCESS_KEY` are all present. `PULL_MODE=edge`
 also requires `EDGE_DOWNLOAD_URL` and `EDGE_DOWNLOAD_SECRET` in the optional
 `registry-edge` secret.
+
+## Automatic image updates
+
+On pushes to `master`, the container workflow runs the reusable quality
+workflow before building and publishing an immutable image. Its deploy job
+streams `update.sh` over SSH and rolls out only the existing registry
+Deployment. PostgreSQL, PVCs, runtime configuration and edge routes stay under
+the first-install procedure above. The single registry replica may briefly
+interrupt requests during an update.
+
+Repository secrets: `SSH_PRIVATE_KEY`, `SSH_HOST`, `SSH_USER`, and
+`SSH_KNOWN_HOSTS` (a pinned host key). The VPS copies the persistent
+`knotree/registry-credentials` pull secret; an expiring Actions token is never
+saved to Kubernetes. Failed readiness blocks workflow success. Roll back with
+`k3s kubectl -n knotree-registry rollout undo deployment/registry`, then check
+rollout status.
