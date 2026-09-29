@@ -69,6 +69,15 @@ pub struct UserSummary {
     pub is_admin: bool,
 }
 
+impl UserSummary {
+    pub fn can_access_repository(&self, repository: &RepositoryName) -> bool {
+        self.is_admin
+            || repository
+                .as_str()
+                .starts_with(&format!("{}/", self.username))
+    }
+}
+
 #[derive(Debug, Clone, Serialize)]
 pub struct Session {
     pub token: String,
@@ -138,6 +147,8 @@ struct UserRecord {
     username: String,
     password_hash: String,
     is_admin: bool,
+    #[serde(default)]
+    federated_identity: Option<(String, String)>,
     #[serde(default)]
     totp_secret: Option<String>,
     #[serde(default)]
@@ -305,12 +316,56 @@ impl AuthService {
             username: username.to_owned(),
             password_hash,
             is_admin: true,
+            federated_identity: None,
             totp_secret: None,
             totp_pending_secret: None,
         };
         let summary = summary(&user);
         state.users.insert(user.username.clone(), user);
         Ok(summary)
+    }
+
+    /// Only call after verifying the central provider's live userinfo response.
+    /// External identities receive an isolated repository namespace and no admin role.
+    pub async fn login_federated(&self, issuer: &str, subject: &str) -> Result<Session, AuthError> {
+        if issuer.is_empty()
+            || issuer.len() > 2048
+            || subject.is_empty()
+            || subject.len() > 255
+            || issuer.chars().chain(subject.chars()).any(char::is_control)
+        {
+            return Err(AuthError::InvalidCredentials);
+        }
+        let identity = (issuer.to_owned(), subject.to_owned());
+        let identity_key = serde_json::to_string(&identity)
+            .map_err(|_| AuthError::PersistentStateSerialization)?;
+        // Digest-derived namespace is stable across restarts and distinct providers.
+        let digest: String = raw_digest(&identity_key)
+            .iter()
+            .map(|byte| format!("{byte:02x}"))
+            .collect();
+        let username = format!("kt-{digest}");
+        let username = username[..64].to_owned();
+        let mut state = self.state.write().await;
+        let user = if let Some(user) = state.users.get(&username) {
+            if user.federated_identity.as_ref() != Some(&identity) || user.is_admin {
+                return Err(AuthError::InvalidCredentials);
+            }
+            user.clone()
+        } else {
+            let user = UserRecord {
+                id: Uuid::new_v4(),
+                username: username.clone(),
+                password_hash: "!sso-only".into(),
+                is_admin: false,
+                federated_identity: Some(identity),
+                totp_secret: None,
+                totp_pending_secret: None,
+            };
+            state.users.insert(username, user.clone());
+            user
+        };
+        Ok(issue_session(&mut state, &user))
     }
 
     pub async fn login(&self, username: &str, password: &str) -> Result<Session, AuthError> {
@@ -601,8 +656,17 @@ impl AuthService {
         };
         let id = credential.id;
         let mut state = self.state.write().await;
-        if !state.users.values().any(|user| user.id == user_id) {
-            return Err(AuthError::InvalidSession);
+        let user = state
+            .users
+            .values()
+            .find(|user| user.id == user_id)
+            .ok_or(AuthError::InvalidSession)?;
+        let user = summary(user);
+        if scopes.iter().any(|scope| {
+            !user.can_access_repository(&scope.repository)
+                || (!user.is_admin && scope.actions.contains(&Action::Admin))
+        }) {
+            return Err(AuthError::NoAccess);
         }
         state.credential_prefixes.insert(prefix.clone(), id);
         state.credentials.insert(id, credential);
@@ -749,12 +813,16 @@ impl AuthService {
         }
         let user_id = Uuid::parse_str(&claims.sub).map_err(|_| AuthError::InvalidCredentials)?;
         let state = self.state.read().await;
-        state
+        let user = state
             .users
             .values()
             .find(|user| user.id == user_id)
             .map(summary)
-            .ok_or(AuthError::InvalidCredentials)
+            .ok_or(AuthError::InvalidCredentials)?;
+        if !user.can_access_repository(repository) {
+            return Err(AuthError::NoAccess);
+        }
+        Ok(user)
     }
 
     pub async fn verify_service_token(&self, token: &str) -> Result<UserSummary, AuthError> {
@@ -925,6 +993,98 @@ fn verify_password(encoded: &str, password: &str) -> Result<(), AuthError> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn federated_users_are_stable_non_admin_and_cannot_grant_other_namespaces() {
+        let auth = AuthService::new("knotree-registry", "knotree-registry", 300);
+        auth.bootstrap_admin("admin", "correct horse battery staple")
+            .await
+            .unwrap();
+        let first = auth
+            .login_federated("https://accounts.knotree.com", "alice-subject")
+            .await
+            .unwrap();
+        assert!(!first.user.is_admin);
+        assert!(
+            auth.login(&first.user.username, "arbitrary password")
+                .await
+                .is_err()
+        );
+        let again = auth
+            .login_federated("https://accounts.knotree.com", "alice-subject")
+            .await
+            .unwrap();
+        assert_eq!(first.user.id, again.user.id);
+        let other = auth
+            .login_federated("https://other.example.com", "alice-subject")
+            .await
+            .unwrap();
+        assert_ne!(first.user.username, other.user.username);
+        let own = scope(&format!("repository:{}/app:pull,push", first.user.username));
+        let credential = auth
+            .create_credential_for_session(&first.token, "own".into(), vec![own.clone()], None)
+            .await
+            .unwrap();
+        assert!(
+            auth.create_credential_for_session(
+                &first.token,
+                "other".into(),
+                vec![scope("repository:admin/app:pull")],
+                None
+            )
+            .await
+            .is_err()
+        );
+        assert!(
+            auth.create_credential_for_session(
+                &first.token,
+                "admin".into(),
+                vec![scope(&format!(
+                    "repository:{}/app:admin",
+                    first.user.username
+                ))],
+                None
+            )
+            .await
+            .is_err()
+        );
+        let token = auth
+            .mint_token(
+                &first.user.username,
+                &credential.secret,
+                "knotree-registry",
+                std::slice::from_ref(&own),
+            )
+            .await
+            .unwrap();
+        assert!(
+            auth.verify_bearer(&token.token, &own.repository, Action::Pull)
+                .await
+                .is_ok()
+        );
+        assert!(
+            auth.verify_bearer(
+                &token.token,
+                &RepositoryName::parse("admin/app").unwrap(),
+                Action::Pull
+            )
+            .await
+            .is_err()
+        );
+        let restored = AuthService::from_snapshot(
+            "knotree-registry",
+            "knotree-registry",
+            300,
+            auth.snapshot().await.unwrap(),
+        )
+        .unwrap();
+        let restored_session = restored
+            .login_federated("https://accounts.knotree.com", "alice-subject")
+            .await
+            .unwrap();
+        assert_eq!(restored_session.user.id, first.user.id);
+        assert_eq!(restored_session.user.username, first.user.username);
+    }
 
     fn scope(value: &str) -> RepositoryScope {
         parse_scope(value).expect("scope")

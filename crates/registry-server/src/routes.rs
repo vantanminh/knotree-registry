@@ -1383,15 +1383,40 @@ async fn me(
     Ok(Json(state.auth.session_user(session).await?))
 }
 
+async fn user_inventory(
+    state: &AppState,
+    user: &registry_auth::UserSummary,
+) -> crate::StorageOverview {
+    let mut inventory = state.catalog.inventory().await;
+    if !user.is_admin {
+        inventory.repositories.retain(|repository| {
+            RepositoryName::parse(&repository.name)
+                .is_ok_and(|name| user.can_access_repository(&name))
+        });
+        inventory.repository_count = inventory.repositories.len();
+        inventory.total_bytes = inventory
+            .repositories
+            .iter()
+            .map(|repository| repository.size)
+            .sum();
+        inventory.referenced_bytes = inventory.total_bytes;
+        inventory.unreferenced_bytes = 0;
+    }
+    inventory
+}
+
 async fn overview(
     State(state): State<AppState>,
     headers: HeaderMap,
 ) -> Result<impl IntoResponse, crate::AppError> {
     let session = cookie_value(&headers).ok_or(registry_auth::AuthError::InvalidSession)?;
     let user = state.auth.session_user(session).await?;
-    let inventory = state.catalog.inventory().await;
+    let inventory = user_inventory(&state, &user).await;
     let credentials = state.auth.list_credentials_for_session(session).await?;
-    let events = state.events.recent(12).await;
+    let mut events = state.events.recent(12).await;
+    if !user.is_admin {
+        events.retain(|event| event.actor.as_deref() == Some(user.username.as_str()));
+    }
     let health = state.readiness().await;
     Ok(Json(json!({
         "user": user,
@@ -1440,9 +1465,9 @@ async fn list_repositories(
     headers: HeaderMap,
 ) -> Result<impl IntoResponse, crate::AppError> {
     let session = cookie_value(&headers).ok_or(registry_auth::AuthError::InvalidSession)?;
-    let _ = state.auth.session_user(session).await?;
+    let user = state.auth.session_user(session).await?;
     Ok(Json(
-        json!({"repositories": state.catalog.inventory().await.repositories}),
+        json!({"repositories": user_inventory(&state, &user).await.repositories}),
     ))
 }
 
@@ -1451,8 +1476,8 @@ async fn storage_overview(
     headers: HeaderMap,
 ) -> Result<impl IntoResponse, crate::AppError> {
     let session = cookie_value(&headers).ok_or(registry_auth::AuthError::InvalidSession)?;
-    let _ = state.auth.session_user(session).await?;
-    Ok(Json(state.catalog.inventory().await))
+    let user = state.auth.session_user(session).await?;
+    Ok(Json(user_inventory(&state, &user).await))
 }
 
 async fn list_uploads(
@@ -1473,9 +1498,12 @@ async fn repository_detail(
     headers: HeaderMap,
 ) -> Result<impl IntoResponse, crate::AppError> {
     let session = cookie_value(&headers).ok_or(registry_auth::AuthError::InvalidSession)?;
-    let _ = state.auth.session_user(session).await?;
+    let user = state.auth.session_user(session).await?;
     let repository = RepositoryName::parse(&repository)
         .map_err(|_| crate::AppError::BadRequest("invalid repository name"))?;
+    if !user.can_access_repository(&repository) {
+        return Err(registry_auth::AuthError::NoAccess.into());
+    }
     let (tags, _) = state.catalog.list_tags(&repository, None, 1000).await?;
     let mut entries = Vec::with_capacity(tags.len());
     for tag in tags {
@@ -1506,9 +1534,13 @@ async fn list_audit(
     headers: HeaderMap,
 ) -> Result<impl IntoResponse, crate::AppError> {
     let session = cookie_value(&headers).ok_or(registry_auth::AuthError::InvalidSession)?;
-    let _ = state.auth.session_user(session).await?;
+    let user = state.auth.session_user(session).await?;
     let limit = query.limit.unwrap_or(50).clamp(1, 200);
-    Ok(Json(json!({"events": state.events.recent(limit).await})))
+    let mut events = state.events.recent(limit).await;
+    if !user.is_admin {
+        events.retain(|event| event.actor.as_deref() == Some(user.username.as_str()));
+    }
+    Ok(Json(json!({"events": events})))
 }
 
 #[derive(Debug, Deserialize)]
@@ -1523,7 +1555,10 @@ async fn list_webhooks(
     headers: HeaderMap,
 ) -> Result<impl IntoResponse, crate::AppError> {
     let session = cookie_value(&headers).ok_or(registry_auth::AuthError::InvalidSession)?;
-    let _ = state.auth.session_user(session).await?;
+    let user = state.auth.session_user(session).await?;
+    if !user.is_admin {
+        return Err(registry_auth::AuthError::NoAccess.into());
+    }
     Ok(Json(json!({"webhooks": state.webhooks.list().await})))
 }
 
@@ -1744,6 +1779,56 @@ mod tests {
 
     use super::*;
     use crate::{AppConfig, AppEnvironment, AppState, StorageBackend};
+
+    #[tokio::test]
+    async fn federated_control_plane_sessions_do_not_read_other_repositories_or_global_webhooks() {
+        let state = AppState::initialize(test_config()).await.unwrap();
+        let session = state
+            .auth
+            .login_federated("https://accounts.knotree.com", "alice-subject")
+            .await
+            .unwrap();
+        let own = RepositoryName::parse(&format!("{}/app", session.user.username)).unwrap();
+        let other = RepositoryName::parse("admin/private").unwrap();
+        let digest = Digest::parse(&format!("sha256:{}", "a".repeat(64))).unwrap();
+        state.catalog.attach_blob(&own, digest.clone()).await;
+        state.catalog.attach_blob(&other, digest).await;
+        let app = router(state);
+        for path in [
+            "/api/v1/repositories/admin/private",
+            "/api/v1/webhooks",
+            "/api/v1/uploads",
+        ] {
+            let response = app
+                .clone()
+                .oneshot(
+                    Request::builder()
+                        .uri(path)
+                        .header("cookie", format!("kntr_session={}", session.token))
+                        .body(Body::empty())
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(response.status(), StatusCode::FORBIDDEN, "{path}");
+        }
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .uri("/api/v1/repositories")
+                    .header("cookie", format!("kntr_session={}", session.token))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = to_bytes(response.into_body(), 1024 * 1024).await.unwrap();
+        let data: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        let repositories = data["repositories"].as_array().unwrap();
+        assert_eq!(repositories.len(), 1);
+        assert_eq!(repositories[0]["name"], own.as_str());
+    }
 
     fn test_config() -> AppConfig {
         AppConfig {

@@ -50,3 +50,17 @@ See [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md), [docs/decisions/DEC-001.md](do
 
 Authentication details and the Docker token exchange are documented in [docs/product/AUTHENTICATION.md](docs/product/AUTHENTICATION.md). The OCI data-plane contract and upload semantics are documented in [docs/product/OCI.md](docs/product/OCI.md).
 The dashboard/API split and local frontend workflow are documented in [docs/product/CONTROL_PLANE.md](docs/product/CONTROL_PLANE.md).
+
+## Central identity and repository namespaces
+
+The authentication service supports federated subjects for the upcoming
+Accounts sign-in integration. Each issuer/subject pair maps to a stable
+`kt-...` username and private repository prefix `<username>/...`, persisted
+with existing authentication state. New federated users are never instance
+administrators and have no Registry password. Token issuance and bearer
+checks enforce this namespace, including denial of instance/admin scopes.
+The control plane filters repository inventory and audit events for these
+users and keeps global webhook/upload/GC operations restricted to admins.
+The existing bootstrap admin and its repositories remain under operator
+control. OAuth login routes and Cloud authorization are still being integrated;
+these primitives alone do not enable SSO in production.
