@@ -36,8 +36,8 @@ impl SsoConfig {
             "true" => {}
             _ => return Err(ConfigError::Sso("SSO_ENABLED must be true or false")),
         }
-        let issuer = std::env::var("SSO_ISSUER")
-            .unwrap_or_else(|_| "https://accounts.knotree.com".into());
+        let issuer =
+            std::env::var("SSO_ISSUER").unwrap_or_else(|_| "https://accounts.knotree.com".into());
         let config = Self {
             service_origin: accounts_service_origin(&issuer)?,
             issuer,
