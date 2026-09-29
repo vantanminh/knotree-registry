@@ -21,5 +21,7 @@
   "SSO_ISSUER": "https://accounts.knotree.com",
   "SSO_CLIENT_ID": "knotree-registry",
   "SSO_REDIRECT_URI": "https://registry.knotree.com/api/v1/auth/sso/callback",
-  "CLOUD_WEBHOOK_URL": "https://cloud.knotree.com/api/v1/public/webhooks/knotree-registry"
+  "CLOUD_WEBHOOK_URL": "https://cloud.knotree.com/api/v1/public/webhooks/knotree-registry",
+  "POSTGRES_USER": "registry",
+  "POSTGRES_DB": "registry"
 }

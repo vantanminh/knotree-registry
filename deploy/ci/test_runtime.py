@@ -18,7 +18,9 @@ class DeploymentContractTests(unittest.TestCase):
         for key, length in self.contract.get("min_length", {}).items():
             self.secrets[key] = "x" * length
         if "POSTGRES_PASSWORD" in self.secrets:
-            self.secrets["DATABASE_URL"] = "postgres://test:test-only-value@postgres/test"
+            user = self.config[self.contract["database_identity"]["user"]]
+            database = self.config[self.contract["database_identity"]["database"]]
+            self.secrets["DATABASE_URL"] = f"postgres://{user}:test-only-value@postgres/{database}"
         if "DATABASE_CREDENTIALS_ENCRYPTION_KEY" in self.secrets:
             self.secrets["DATABASE_CREDENTIALS_ENCRYPTION_KEY"] = base64.urlsafe_b64encode(b"x" * 32).decode()
 
@@ -72,28 +74,66 @@ class DeploymentContractTests(unittest.TestCase):
         with self.assertRaises(runtime.Invalid):
             runtime.validate(self.contract, self.config, secrets)
 
+    def test_database_identity_mismatch_is_rejected(self):
+        secrets = {**self.secrets, "DATABASE_URL": "postgres://other:test-only-value@postgres/other"}
+        with self.assertRaisesRegex(runtime.Invalid, "POSTGRES_USER and POSTGRES_DB"):
+            runtime.validate(self.contract, self.config, secrets)
+
     def test_existing_key_mismatch_prevents_all_mutations(self):
         objects = runtime.manifests(self.contract, self.config, self.secrets)
         name = next(iter(self.contract["preserve"]))
         key = self.contract["preserve"][name][0]
         secret = copy.deepcopy(next(o for o in objects if o["metadata"]["name"] == name))
         secret["data"][key] = base64.b64encode(b"different-existing-value").decode()
+        calls = []
         def response(args, *unused, **kwargs):
+            calls.append(args)
+            if args[:2] == ["get", "namespace"]:
+                return "namespace knotree-registry\n"
+            if args[:2] == ["get", "statefulset"]:
+                return json.dumps({"spec": {"template": {"spec": {"containers": [{"name": "postgres", "env": [
+                    {"name": "POSTGRES_USER", "value": self.config["POSTGRES_USER"]},
+                    {"name": "POSTGRES_DB", "value": self.config["POSTGRES_DB"]},
+                ]}]}}}})
             self.assertEqual(args[0], "get")
             return json.dumps(secret) if args[2] == name else None
         with patch.object(runtime, "kube", side_effect=response), self.assertRaises(runtime.Invalid):
             runtime.apply(self.contract, self.config, self.secrets)
+        self.assertFalse(any(call[0] in {"apply", "patch"} for call in calls))
 
     def test_same_keys_can_apply_without_deleting_stateful_resources(self):
         calls = []
         def response(args, data=None, **kwargs):
             calls.append(args)
+            if args[:2] == ["get", "namespace"]:
+                return "namespace knotree-registry\n"
+            if args[:2] == ["get", "statefulset"]:
+                return json.dumps({"spec": {"template": {"spec": {"containers": [{"name": "postgres", "env": [
+                    {"name": "POSTGRES_USER", "value": self.config["POSTGRES_USER"]},
+                    {"name": "POSTGRES_DB", "value": self.config["POSTGRES_DB"]},
+                ]}]}}}})
             return None
         with patch.object(runtime, "kube", side_effect=response):
             runtime.apply(self.contract, self.config, self.secrets)
         self.assertTrue(any(c[0] == "apply" for c in calls))
         self.assertFalse(any(c[0] == "delete" for c in calls))
         self.assertTrue(all("postgres" not in c or c[0] == "get" for c in calls))
+
+    def test_statefulset_identity_mismatch_prevents_all_mutations(self):
+        calls = []
+        def response(args, data=None, **kwargs):
+            calls.append(args)
+            if args[:2] == ["get", "namespace"]:
+                return "namespace knotree-registry\n"
+            if args[:2] == ["get", "statefulset"]:
+                return json.dumps({"spec": {"template": {"spec": {"containers": [{"name": "postgres", "env": [
+                    {"name": "POSTGRES_USER", "value": "wrong"},
+                    {"name": "POSTGRES_DB", "value": self.config["POSTGRES_DB"]},
+                ]}]}}}})
+            return None
+        with patch.object(runtime, "kube", side_effect=response), self.assertRaisesRegex(runtime.Invalid, "identity change"):
+            runtime.apply(self.contract, self.config, self.secrets)
+        self.assertFalse(any(call[0] in {"apply", "patch"} for call in calls))
 
 
 if __name__ == "__main__":

@@ -21,6 +21,8 @@ GitHub CI transfers configuration over pinned SSH stdin into a temporary directo
 
 For an existing installation, seed GitHub with the exact current database password/URL and encryption keys. The deploy compares protected live credentials before any Kubernetes write and fails if they differ; updating a Secret is not a PostgreSQL password rotation or data re-encryption. Use a separate reviewed rotation flow for these changes. The deploy never silently reuses server values when a GitHub value is missing.
 
+`POSTGRES_USER` and `POSTGRES_DB` are required GitHub config values. They must match `DATABASE_URL` and the existing PostgreSQL StatefulSet; a mismatch fails before any ConfigMap or Secret write. The remote deploy also requires k3s Secret encryption enabled with re-encryption complete, or it fails before applying runtime values.
+
 Local verification: `python3 -m unittest discover -s deploy/ci -p 'test_*.py'`. Real image builds and backend tests remain GitHub CI tasks. Local code/contract checks alone do not prove deployment.
 
 ## Shared Cloud/Registry webhook

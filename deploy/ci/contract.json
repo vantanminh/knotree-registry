@@ -26,7 +26,9 @@
     "SSO_ISSUER",
     "SSO_CLIENT_ID",
     "SSO_REDIRECT_URI",
-    "CLOUD_WEBHOOK_URL"
+    "CLOUD_WEBHOOK_URL",
+    "POSTGRES_USER",
+    "POSTGRES_DB"
   ],
   "secrets": [
     "DATABASE_URL",
@@ -69,6 +71,19 @@
     "SSO_REDIRECT_URI",
     "CLOUD_WEBHOOK_URL"
   ],
+  "database_identity": {
+    "user": "POSTGRES_USER",
+    "database": "POSTGRES_DB"
+  },
+  "preserve_statefulset_env": {
+    "name": "postgres",
+    "container": "postgres",
+    "required": true,
+    "values": {
+      "POSTGRES_USER": "POSTGRES_USER",
+      "POSTGRES_DB": "POSTGRES_DB"
+    }
+  },
   "auxiliary_secrets": [
     "GHCR_USERNAME",
     "GHCR_TOKEN",
