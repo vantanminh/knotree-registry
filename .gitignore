@@ -17,3 +17,10 @@ harness.db-shm
 # Frontend dependencies and build output
 /web/node_modules/
 /web/dist/
+
+# CI-only deployment payloads
+deploy/ci/__pycache__/
+frontend/wrangler.ci.json
+deploy/ci/runtime.json
+deploy/ci/values.json
+deploy/ci/patch.json

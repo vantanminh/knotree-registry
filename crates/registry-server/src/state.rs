@@ -157,6 +157,12 @@ impl AppState {
                 .map_err(|error| AppError::State(error.to_string()))?,
             None => WebhookRegistry::default(),
         };
+        if let Some((url, secret)) = &config.cloud_webhook {
+            webhooks
+                .configure_cloud(url.clone(), secret.clone())
+                .await
+                .map_err(|_| crate::ConfigError::CloudWebhook)?;
+        }
         let state = Self {
             cloud_grants: Arc::new(tokio::sync::Mutex::new(
                 crate::cloud_grants::CloudGrants::default(),

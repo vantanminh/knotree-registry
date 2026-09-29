@@ -9,9 +9,7 @@ export KUBECONFIG="${KUBECONFIG:-/etc/rancher/k3s/k3s.yaml}"
 # PostgreSQL, routing and operator configuration during image updates.
 k3s kubectl -n knotree-registry get deployment registry >/dev/null
 k3s kubectl -n knotree-registry get secret registry-app >/dev/null
-k3s kubectl -n knotree get secret registry-credentials -o json |
-  python3 -c 'import json,sys; d=json.load(sys.stdin); assert d.get("type")=="kubernetes.io/dockerconfigjson"; assert ".dockerconfigjson" in d.get("data",{}); d["metadata"]={"name":"registry-credentials","namespace":"knotree-registry"}; d.pop("immutable",None); print(json.dumps(d))' |
-  k3s kubectl apply -f - >/dev/null
+# Pull and runtime secrets have already been applied from the validated CI payload.
 k3s kubectl -n knotree-registry set image deployment/registry registry="$1"
 k3s kubectl -n knotree-registry rollout status deployment/registry --timeout=600s
 k3s kubectl -n knotree-registry get deployment registry -o json |

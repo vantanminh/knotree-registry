@@ -115,6 +115,48 @@ enum WebhookSnapshotInput {
 }
 
 impl WebhookRegistry {
+    /// Operator-managed Cloud integration: stable ID and GitHub-supplied signing
+    /// secret, applied after restoring persisted state on every startup.
+    pub async fn configure_cloud(&self, url: String, secret: String) -> Result<(), WebhookError> {
+        let parsed = url::Url::parse(&url).map_err(|_| WebhookError::InvalidUrl)?;
+        if parsed.scheme() != "https"
+            || parsed.host_str().is_none()
+            || !parsed.username().is_empty()
+            || parsed.password().is_some()
+            || parsed.query().is_some()
+            || parsed.fragment().is_some()
+            || secret.len() < 32
+            || secret.chars().any(char::is_control)
+        {
+            return Err(WebhookError::InvalidUrl);
+        }
+        let id = Uuid::from_u128(0x3de45586_d014_4c43_ba11_10f019bc94f5);
+        let mut endpoints = self.endpoints.write().await;
+        let created_at = endpoints
+            .get(&id)
+            .map(|e| e.summary.created_at)
+            .unwrap_or_else(now_seconds);
+        for endpoint in endpoints.values_mut() {
+            if endpoint.summary.id != id && endpoint.summary.url == url {
+                endpoint.summary.enabled = false;
+            }
+        }
+        endpoints.insert(
+            id,
+            WebhookEndpoint {
+                summary: WebhookSummary {
+                    id,
+                    url,
+                    events: [EventKind::TagUpdated].into_iter().collect(),
+                    enabled: true,
+                    created_at,
+                },
+                secret,
+            },
+        );
+        Ok(())
+    }
+
     pub fn from_snapshot(value: serde_json::Value) -> Result<Self, serde_json::Error> {
         let snapshot = match serde_json::from_value::<WebhookSnapshotInput>(value)? {
             WebhookSnapshotInput::Current(snapshot) => snapshot,
@@ -489,6 +531,41 @@ fn now_seconds() -> u64 {
 
 #[cfg(test)]
 mod tests {
+    #[tokio::test]
+    async fn cloud_webhook_is_idempotent_and_uses_the_ci_signing_secret() {
+        let registry = WebhookRegistry::default();
+        let url = "https://cloud.knotree.com/api/v1/public/webhooks/knotree-registry";
+        let secret = "x".repeat(32);
+        registry
+            .configure_cloud(url.into(), secret.clone())
+            .await
+            .unwrap();
+        let initial = registry.list().await;
+        registry
+            .configure_cloud(url.into(), secret.clone())
+            .await
+            .unwrap();
+        assert_eq!(registry.list().await, initial);
+        let restored = WebhookRegistry::from_snapshot(registry.snapshot().await.unwrap()).unwrap();
+        let signer = restored.signer(initial[0].id).await.unwrap();
+        let expected = WebhookSigner::new(&secret, Duration::from_secs(300)).unwrap();
+        let id = Uuid::new_v4();
+        assert_eq!(
+            signer.sign(id, 100, b"body"),
+            expected.sign(id, 100, b"body")
+        );
+        assert_eq!(
+            initial[0].events,
+            [EventKind::TagUpdated].into_iter().collect::<BTreeSet<_>>()
+        );
+        assert!(
+            registry
+                .configure_cloud("http://attacker.example".into(), secret)
+                .await
+                .is_err()
+        );
+    }
+
     use super::*;
 
     #[test]

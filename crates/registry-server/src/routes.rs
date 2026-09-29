@@ -1968,6 +1968,7 @@ pub(crate) mod tests {
     pub(crate) fn test_config() -> AppConfig {
         AppConfig {
             sso: None,
+            cloud_webhook: None,
             environment: AppEnvironment::Development,
             bind_addr: "127.0.0.1:0".parse().expect("addr"),
             public_url: "http://localhost:8080".to_owned(),

@@ -1,68 +1,74 @@
 name: container
-
-on:
-  push:
-    branches:
-      - master
-  workflow_dispatch:
-
 permissions:
   contents: read
   packages: write
-
 env:
   IMAGE_NAME: ghcr.io/vantanminh/knotree-registry
-
 concurrency:
   group: registry-production
   cancel-in-progress: false
-
 jobs:
+  deploy-preflight:
+    if: github.ref == 'refs/heads/master'
+    runs-on: ubuntu-latest
+    steps:
+    - uses: actions/checkout@v4
+    - name: Fail deployment on missing GitHub configuration
+      env:
+        SSH_PRIVATE_KEY: ${{ secrets.SSH_PRIVATE_KEY }}
+        SSH_HOST: ${{ secrets.SSH_HOST }}
+        SSH_USER: ${{ secrets.SSH_USER }}
+        SSH_KNOWN_HOSTS: ${{ secrets.SSH_KNOWN_HOSTS }}
+        K8S_CONFIG_JSON: ${{ vars.K8S_CONFIG_JSON }}
+        K8S_SECRETS_JSON: ${{ secrets.K8S_SECRETS_JSON }}
+        KNOTREE_REGISTRY_WEBHOOK_SECRET: ${{ secrets.KNOTREE_REGISTRY_WEBHOOK_SECRET }}
+      run: |
+        set -euo pipefail
+        task_dir=$(mktemp -d)
+        trap 'rm -rf "$task_dir"' EXIT
+        python3 deploy/ci/runtime.py prepare "$task_dir"
   quality:
     uses: ./.github/workflows/quality.yml
-
   build-and-push:
-    needs: quality
+    needs:
+    - quality
+    - deploy-preflight
+    - deploy-contract-tests
     runs-on: ubuntu-latest
     outputs:
       digest: ${{ steps.build.outputs.digest }}
     steps:
-      - name: Check out source
-        uses: actions/checkout@v4
-
-      - name: Set up Buildx
-        uses: docker/setup-buildx-action@v3
-
-      - name: Log in to GHCR
-        uses: docker/login-action@v3
-        with:
-          registry: ghcr.io
-          username: ${{ github.actor }}
-          password: ${{ secrets.GITHUB_TOKEN }}
-
-      - name: Calculate image metadata
-        id: meta
-        uses: docker/metadata-action@v5
-        with:
-          images: ${{ env.IMAGE_NAME }}
-          tags: |
-            type=sha,prefix=sha-
-            type=raw,value=latest,enable={{is_default_branch}}
-
-      - name: Build and publish image
-        id: build
-        uses: docker/build-push-action@v6
-        with:
-          context: .
-          file: deploy/registry.Dockerfile
-          push: true
-          tags: ${{ steps.meta.outputs.tags }}
-          labels: ${{ steps.meta.outputs.labels }}
-          cache-from: type=gha
-          cache-to: type=gha,mode=max
-          provenance: true
-          sbom: true
-
+    - name: Check out source
+      uses: actions/checkout@v4
+    - name: Set up Buildx
+      uses: docker/setup-buildx-action@v3
+    - name: Log in to GHCR
+      uses: docker/login-action@v3
+      with:
+        registry: ghcr.io
+        username: ${{ github.actor }}
+        password: ${{ secrets.GITHUB_TOKEN }}
+    - name: Calculate image metadata
+      id: meta
+      uses: docker/metadata-action@v5
+      with:
+        images: ${{ env.IMAGE_NAME }}
+        tags: |
+          type=sha,prefix=sha-
+          type=raw,value=latest,enable={{is_default_branch}}
+    - name: Build and publish image
+      id: build
+      uses: docker/build-push-action@v6
+      with:
+        context: .
+        file: deploy/registry.Dockerfile
+        push: true
+        tags: ${{ steps.meta.outputs.tags }}
+        labels: ${{ steps.meta.outputs.labels }}
+        cache-from: type=gha
+        cache-to: type=gha,mode=max
+        provenance: true
+        sbom: true
   deploy:
     needs: build-and-push
     if: github.ref == 'refs/heads/master'
@@ -70,23 +76,28 @@ jobs:
     permissions:
       contents: read
     steps:
-      - uses: actions/checkout@v4
-      - name: Deploy immutable CI image to k3s
-        env:
-          SSH_PRIVATE_KEY: ${{ secrets.SSH_PRIVATE_KEY }}
-          SSH_HOST: ${{ secrets.SSH_HOST }}
-          SSH_USER: ${{ secrets.SSH_USER }}
-          SSH_KNOWN_HOSTS: ${{ secrets.SSH_KNOWN_HOSTS }}
-          IMAGE_DIGEST: ${{ needs.build-and-push.outputs.digest }}
-        run: |
-          set -euo pipefail
-          test -n "$SSH_PRIVATE_KEY" && test -n "$SSH_HOST" && test -n "$SSH_USER" && test -n "$SSH_KNOWN_HOSTS"
-          install -d -m 700 "$HOME/.ssh"
-          printf '%s\n' "$SSH_PRIVATE_KEY" > "$HOME/.ssh/id_ed25519"
-          chmod 600 "$HOME/.ssh/id_ed25519"
-          printf '%s\n' "$SSH_KNOWN_HOSTS" > "$HOME/.ssh/known_hosts"
-          trap 'rm -f "$HOME/.ssh/id_ed25519"' EXIT
-          [[ "$IMAGE_DIGEST" =~ ^sha256:[a-f0-9]{64}$ ]]
-          ssh -o StrictHostKeyChecking=yes -o IdentitiesOnly=yes -o ServerAliveInterval=30 -o ServerAliveCountMax=10 \
-            "${SSH_USER}@${SSH_HOST}" "bash -s -- ghcr.io/vantanminh/knotree-registry@$IMAGE_DIGEST" \
-            < deploy/k8s/update.sh
+    - uses: actions/checkout@v4
+    - name: Apply validated GitHub runtime and deploy CI images
+      env:
+        SSH_PRIVATE_KEY: ${{ secrets.SSH_PRIVATE_KEY }}
+        SSH_HOST: ${{ secrets.SSH_HOST }}
+        SSH_USER: ${{ secrets.SSH_USER }}
+        SSH_KNOWN_HOSTS: ${{ secrets.SSH_KNOWN_HOSTS }}
+        K8S_CONFIG_JSON: ${{ vars.K8S_CONFIG_JSON }}
+        K8S_SECRETS_JSON: ${{ secrets.K8S_SECRETS_JSON }}
+        IMAGE_DIGEST: ${{ needs.build-and-push.outputs.digest }}
+        KNOTREE_REGISTRY_WEBHOOK_SECRET: ${{ secrets.KNOTREE_REGISTRY_WEBHOOK_SECRET }}
+      run: bash deploy/ci/deliver.sh "ghcr.io/vantanminh/knotree-registry@$IMAGE_DIGEST"
+    concurrency:
+      group: knotree-registry-production-runtime
+      cancel-in-progress: false
+  deploy-contract-tests:
+    runs-on: ubuntu-latest
+    steps:
+    - uses: actions/checkout@v4
+    - run: python3 -m unittest discover -s deploy/ci -p "test_*.py"
+'on':
+  push:
+    branches:
+    - master
+  workflow_dispatch: null

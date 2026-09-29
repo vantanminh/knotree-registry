@@ -1,0 +1,100 @@
+{
+  "namespace": "knotree-registry",
+  "configmap": "registry-config",
+  "runtime_secret": "registry-app",
+  "pull_secret": "registry-credentials",
+  "config": [
+    "STORAGE_BACKEND",
+    "R2_REGION",
+    "PULL_MODE",
+    "DATABASE_MAX_CONNECTIONS",
+    "REQUEST_BODY_LIMIT_BYTES",
+    "UPLOAD_CHUNK_LIMIT_BYTES",
+    "REGISTRY_TOKEN_TTL_SECONDS",
+    "APP_ENV",
+    "BIND_ADDR",
+    "PUBLIC_REGISTRY_URL",
+    "CONTROL_PLANE_ORIGINS",
+    "REQUIRE_DATABASE",
+    "COOKIE_SECURE",
+    "STATIC_ROOT",
+    "STORAGE_ROOT",
+    "TOKEN_ISSUER",
+    "TOKEN_SERVICE",
+    "RUST_LOG",
+    "SSO_ENABLED",
+    "SSO_ISSUER",
+    "SSO_CLIENT_ID",
+    "SSO_REDIRECT_URI",
+    "CLOUD_WEBHOOK_URL"
+  ],
+  "secrets": [
+    "DATABASE_URL",
+    "POSTGRES_PASSWORD",
+    "BOOTSTRAP_ADMIN_USERNAME",
+    "BOOTSTRAP_ADMIN_PASSWORD",
+    "GHCR_USERNAME",
+    "GHCR_TOKEN",
+    "KNOTREE_REGISTRY_WEBHOOK_SECRET"
+  ],
+  "optional_secrets": [
+    "R2_ENDPOINT",
+    "R2_BUCKET",
+    "R2_ACCESS_KEY_ID",
+    "R2_SECRET_ACCESS_KEY",
+    "EDGE_DOWNLOAD_URL",
+    "EDGE_DOWNLOAD_SECRET"
+  ],
+  "secret_groups": [
+    [
+      "R2_ENDPOINT",
+      "R2_BUCKET",
+      "R2_ACCESS_KEY_ID",
+      "R2_SECRET_ACCESS_KEY"
+    ],
+    [
+      "EDGE_DOWNLOAD_URL",
+      "EDGE_DOWNLOAD_SECRET"
+    ]
+  ],
+  "fixed": {
+    "APP_ENV": "production",
+    "COOKIE_SECURE": "true",
+    "REQUIRE_DATABASE": "true",
+    "SSO_ENABLED": "true"
+  },
+  "https": [
+    "PUBLIC_REGISTRY_URL",
+    "SSO_ISSUER",
+    "SSO_REDIRECT_URI",
+    "CLOUD_WEBHOOK_URL"
+  ],
+  "auxiliary_secrets": [
+    "GHCR_USERNAME",
+    "GHCR_TOKEN",
+    "POSTGRES_PASSWORD"
+  ],
+  "extra_secrets": [
+    {
+      "name": "registry-postgres",
+      "keys": {
+        "password": "POSTGRES_PASSWORD"
+      }
+    }
+  ],
+  "preserve": {
+    "registry-app": [
+      "DATABASE_URL"
+    ],
+    "registry-postgres": [
+      "password"
+    ]
+  },
+  "min_length": {
+    "KNOTREE_REGISTRY_WEBHOOK_SECRET": 32,
+    "BOOTSTRAP_ADMIN_PASSWORD": 12
+  },
+  "external_secrets": [
+    "KNOTREE_REGISTRY_WEBHOOK_SECRET"
+  ]
+}

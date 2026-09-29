@@ -25,6 +25,7 @@ pub enum PullMode {
 #[derive(Debug, Clone)]
 pub struct AppConfig {
     pub sso: Option<crate::sso::SsoConfig>,
+    pub cloud_webhook: Option<(String, String)>,
     pub environment: AppEnvironment,
     pub bind_addr: SocketAddr,
     pub public_url: String,
@@ -55,6 +56,10 @@ pub struct AppConfig {
 
 #[derive(Debug, Error)]
 pub enum ConfigError {
+    #[error(
+        "Cloud webhook requires HTTPS CLOUD_WEBHOOK_URL and KNOTREE_REGISTRY_WEBHOOK_SECRET of at least 32 characters"
+    )]
+    CloudWebhook,
     #[error("invalid Accounts SSO configuration: {0}")]
     Sso(&'static str),
     #[error("invalid BIND_ADDR: {0}")]
@@ -182,6 +187,14 @@ impl AppConfig {
             .collect();
         let config = Self {
             sso: crate::sso::SsoConfig::from_env(environment)?,
+            cloud_webhook: match (
+                env::var("CLOUD_WEBHOOK_URL").ok(),
+                env::var("KNOTREE_REGISTRY_WEBHOOK_SECRET").ok(),
+            ) {
+                (None, None) => None,
+                (Some(url), Some(secret)) => Some((url, secret)),
+                _ => return Err(ConfigError::CloudWebhook),
+            },
             environment,
             bind_addr,
             public_url,
@@ -214,6 +227,20 @@ impl AppConfig {
     }
 
     pub fn validate(&self) -> Result<(), ConfigError> {
+        if let Some((url, secret)) = &self.cloud_webhook {
+            let parsed = url::Url::parse(url).map_err(|_| ConfigError::CloudWebhook)?;
+            if parsed.scheme() != "https"
+                || parsed.host_str().is_none()
+                || !parsed.username().is_empty()
+                || parsed.password().is_some()
+                || parsed.query().is_some()
+                || parsed.fragment().is_some()
+                || secret.len() < 32
+                || secret.chars().any(char::is_control)
+            {
+                return Err(ConfigError::CloudWebhook);
+            }
+        }
         if let Some(sso) = &self.sso {
             sso.validate(self.environment == AppEnvironment::Production)?;
         }
@@ -326,6 +353,7 @@ mod tests {
     fn config() -> AppConfig {
         AppConfig {
             sso: None,
+            cloud_webhook: None,
             environment: AppEnvironment::Development,
             bind_addr: "127.0.0.1:8080".parse().expect("address"),
             public_url: "http://localhost:8080".to_owned(),
