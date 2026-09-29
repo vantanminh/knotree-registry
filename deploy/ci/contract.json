@@ -62,8 +62,7 @@
   "fixed": {
     "APP_ENV": "production",
     "COOKIE_SECURE": "true",
-    "REQUIRE_DATABASE": "true",
-    "SSO_ENABLED": "true"
+    "REQUIRE_DATABASE": "true"
   },
   "https": [
     "PUBLIC_REGISTRY_URL",

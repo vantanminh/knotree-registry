@@ -112,13 +112,12 @@ also requires `EDGE_DOWNLOAD_URL` and `EDGE_DOWNLOAD_SECRET` in the optional
 
 On pushes to `master`, the container workflow runs the reusable quality
 workflow before building and publishing an immutable image. Its deploy job
-streams `update.sh` over SSH and rolls out only the existing registry
+applies the image with kubectl and rolls out only the existing registry
 Deployment. PostgreSQL, PVCs, runtime configuration and edge routes stay under
 the first-install procedure above. The single registry replica may briefly
 interrupt requests during an update.
 
-Repository secrets: `SSH_PRIVATE_KEY`, `SSH_HOST`, `SSH_USER`, and
-`SSH_KNOWN_HOSTS` (a pinned host key). The VPS copies the persistent
+Repository secret: `KUBE_CONFIG` (production API `https://15.235.210.66:6443`). The workflow copies the persistent
 `knotree/registry-credentials` pull secret; an expiring Actions token is never
 saved to Kubernetes. Failed readiness blocks workflow success. Roll back with
 `k3s kubectl -n knotree-registry rollout undo deployment/registry`, then check

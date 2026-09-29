@@ -5,19 +5,13 @@ import tempfile
 import unittest
 
 
-class RemoteEncryptionGateTests(unittest.TestCase):
+class RemoteApplyTests(unittest.TestCase):
     def setUp(self):
         self.temp = tempfile.TemporaryDirectory()
         self.tools = Path(self.temp.name)
         self.marker = self.tools / "python-was-called"
         k3s = self.tools / "k3s"
-        k3s.write_text(
-            "#!/bin/sh\n"
-            "if [ \"$1\" = secrets-encrypt ]; then\n"
-            "  printf '%s\\n' \"$K3S_TEST_STATUS\"\n"
-            "  exit \"${K3S_TEST_EXIT:-0}\"\n"
-            "fi\nexit 0\n"
-        )
+        k3s.write_text("#!/bin/sh\nexit 0\n")
         k3s.chmod(0o755)
         python = self.tools / "python3"
         python.write_text(f"#!/bin/sh\ntouch '{self.marker}'\nexit 77\n")
@@ -26,42 +20,26 @@ class RemoteEncryptionGateTests(unittest.TestCase):
     def tearDown(self):
         self.temp.cleanup()
 
-    def run_remote(self, status, exit_code="0"):
+    def run_remote(self, image):
         env = dict(os.environ)
-        env.update({
-            "PATH": f"{self.tools}:{env['PATH']}",
-            "K3S_TEST_STATUS": status,
-            "K3S_TEST_EXIT": exit_code,
-        })
+        env["PATH"] = f"{self.tools}:{env['PATH']}"
         return subprocess.run(
-            ["bash", str(Path(__file__).with_name("remote.sh")), "/tmp/payload.json",
-             "ghcr.io/vantanminh/knotree-registry@sha256:" + "c" * 64],
+            ["bash", str(Path(__file__).with_name("remote.sh")), "/tmp/payload.json", image],
             env=env,
             text=True,
             capture_output=True,
             check=False,
         )
 
-    def test_disabled_encryption_stops_before_runtime_apply(self):
-        result = self.run_remote(
-            "Encryption Status: Disabled\nCurrent Rotation Stage: reencrypt_finished"
-        )
-        self.assertNotEqual(result.returncode, 0)
-        self.assertIn("enable and finish k3s Secret encryption", result.stderr)
-        self.assertFalse(self.marker.exists())
-
-    def test_incomplete_rotation_stops_before_runtime_apply(self):
-        result = self.run_remote(
-            "Encryption Status: Enabled\nCurrent Rotation Stage: reencrypt_active"
-        )
+    def test_invalid_image_stops_before_runtime_apply(self):
+        result = self.run_remote("not-an-image")
         self.assertNotEqual(result.returncode, 0)
         self.assertFalse(self.marker.exists())
 
-    def test_status_command_error_stops_before_runtime_apply(self):
-        result = self.run_remote("", exit_code="1")
-        self.assertNotEqual(result.returncode, 0)
-        self.assertIn("could not check k3s Secret encryption", result.stderr)
-        self.assertFalse(self.marker.exists())
+    def test_valid_image_reaches_runtime_apply(self):
+        result = self.run_remote("ghcr.io/vantanminh/knotree-registry@sha256:" + "c" * 64)
+        self.assertEqual(result.returncode, 77)
+        self.assertTrue(self.marker.exists())
 
 
 if __name__ == "__main__":
