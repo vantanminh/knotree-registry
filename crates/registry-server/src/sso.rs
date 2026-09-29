@@ -21,6 +21,7 @@ use crate::{AppConfig, AppEnvironment, AppError, AppState, ConfigError};
 #[derive(Clone, Debug)]
 pub struct SsoConfig {
     pub issuer: String,
+    pub service_origin: String,
     pub client_id: String,
     pub redirect_uri: String,
 }
@@ -35,9 +36,11 @@ impl SsoConfig {
             "true" => {}
             _ => return Err(ConfigError::Sso("SSO_ENABLED must be true or false")),
         }
+        let issuer = std::env::var("SSO_ISSUER")
+            .unwrap_or_else(|_| "https://accounts.knotree.com".into());
         let config = Self {
-            issuer: std::env::var("SSO_ISSUER")
-                .unwrap_or_else(|_| "https://accounts.knotree.com".into()),
+            service_origin: accounts_service_origin(&issuer)?,
+            issuer,
             client_id: std::env::var("SSO_CLIENT_ID").unwrap_or_else(|_| "knotree-registry".into()),
             redirect_uri: std::env::var("SSO_REDIRECT_URI")
                 .unwrap_or_else(|_| "https://registry.knotree.com/api/v1/auth/sso/callback".into()),
@@ -76,6 +79,28 @@ impl SsoConfig {
         }
         Ok(())
     }
+}
+
+fn accounts_service_origin(issuer: &str) -> Result<String, ConfigError> {
+    let value = std::env::var("SSO_SERVICE_ORIGIN").unwrap_or_default();
+    if value.is_empty() {
+        return Ok(issuer.to_string());
+    }
+    let url = Url::parse(&value).map_err(|_| ConfigError::Sso("invalid service origin"))?;
+    if url.scheme() == "http"
+        && url.host_str() == Some("knotree-accounts.knotree-accounts.svc.cluster.local")
+        && url.port().unwrap_or(80) == 80
+        && matches!(url.path(), "" | "/")
+        && url.username().is_empty()
+        && url.password().is_none()
+        && url.query().is_none()
+        && url.fragment().is_none()
+    {
+        return Ok(value);
+    }
+    Err(ConfigError::Sso(
+        "SSO_SERVICE_ORIGIN must be the in-cluster Accounts service",
+    ))
 }
 
 pub(crate) struct LoginAttempt {
@@ -248,7 +273,7 @@ pub(crate) async fn callback(
         .build()
         .map_err(|_| invalid_login())?;
     let tokens = client
-        .post(format!("{}/oauth/token", config.issuer))
+        .post(format!("{}/oauth/token", config.service_origin))
         .form(&[
             ("grant_type", "authorization_code"),
             ("client_id", &config.client_id),
@@ -264,7 +289,7 @@ pub(crate) async fn callback(
         return Err(invalid_login());
     }
     let profile = client
-        .get(format!("{}/oauth/userinfo", config.issuer))
+        .get(format!("{}/oauth/userinfo", config.service_origin))
         .bearer_auth(&tokens.access_token)
         .send()
         .await
@@ -346,6 +371,7 @@ mod tests {
     fn validates_provider_origin_and_https_callbacks() {
         let mut config = SsoConfig {
             issuer: "https://accounts.knotree.com".into(),
+            service_origin: "https://accounts.knotree.com".into(),
             client_id: "knotree-registry".into(),
             redirect_uri: "https://registry.knotree.com/api/v1/auth/sso/callback".into(),
         };

@@ -1877,7 +1877,8 @@ pub(crate) mod tests {
         });
         let mut config = test_config();
         config.sso = Some(crate::SsoConfig {
-            issuer,
+            issuer: issuer.clone(),
+            service_origin: issuer,
             client_id: "knotree-registry".into(),
             redirect_uri: "http://localhost:8080/api/v1/auth/sso/callback".into(),
         });

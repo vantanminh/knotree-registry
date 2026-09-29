@@ -19,6 +19,7 @@
   "RUST_LOG": "registry_server=info,tower_http=info",
   "SSO_ENABLED": "false",
   "SSO_ISSUER": "https://accounts.knotree.com",
+  "SSO_SERVICE_ORIGIN": "http://knotree-accounts.knotree-accounts.svc.cluster.local",
   "SSO_CLIENT_ID": "knotree-registry",
   "SSO_REDIRECT_URI": "https://registry.knotree.com/api/v1/auth/sso/callback",
   "CLOUD_WEBHOOK_URL": "https://cloud.knotree.com/api/v1/public/webhooks/knotree-registry",

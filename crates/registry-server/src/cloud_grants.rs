@@ -357,6 +357,7 @@ mod flow_tests {
         let mut config = crate::routes::tests::test_config();
         config.sso = Some(crate::SsoConfig {
             issuer: "https://accounts.knotree.com".into(),
+            service_origin: "https://accounts.knotree.com".into(),
             client_id: "knotree-registry".into(),
             redirect_uri: "https://registry.knotree.com/api/v1/auth/sso/callback".into(),
         });
