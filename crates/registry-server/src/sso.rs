@@ -82,6 +82,7 @@ pub(crate) struct LoginAttempt {
     verifier: String,
     config: SsoConfig,
     expires: Instant,
+    return_to: String,
 }
 pub(crate) type LoginAttempts = HashMap<[u8; 32], LoginAttempt>;
 
@@ -124,7 +125,26 @@ fn configured(state: &AppState) -> Result<&SsoConfig, AppError> {
 pub(crate) async fn configuration(State(state): State<AppState>) -> Json<serde_json::Value> {
     Json(serde_json::json!({"enabled":state.config.sso.is_some()}))
 }
-pub(crate) async fn start(State(state): State<AppState>) -> Result<Response, AppError> {
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub(crate) struct StartQuery {
+    return_to: Option<String>,
+}
+
+fn safe_return_to(value: Option<&str>) -> String {
+    value
+        .and_then(|path| {
+            path.strip_prefix("/cloud/authorize/")
+                .and_then(|id| Uuid::parse_str(id).ok())
+                .map(|id| format!("/cloud/authorize/{id}"))
+        })
+        .unwrap_or_else(|| "/".into())
+}
+
+pub(crate) async fn start(
+    State(state): State<AppState>,
+    Query(query): Query<StartQuery>,
+) -> Result<Response, AppError> {
     let config = configured(&state)?;
     let state_token = random_token();
     let browser = random_token();
@@ -140,6 +160,7 @@ pub(crate) async fn start(State(state): State<AppState>) -> Result<Response, App
         LoginAttempt {
             verifier,
             config: config.clone(),
+            return_to: safe_return_to(query.return_to.as_deref()),
             expires: Instant::now() + Duration::from_secs(600),
         },
     );
@@ -270,7 +291,7 @@ pub(crate) async fn callback(
         let _ = state.auth.logout(&session.token).await;
         return Err(error);
     }
-    let mut response = Redirect::to("/").into_response();
+    let mut response = Redirect::to(&attempt.return_to).into_response();
     response.headers_mut().append(
         header::SET_COOKIE,
         crate::routes::session_cookie(&state, &session.token, session.expires_at),
@@ -306,6 +327,21 @@ async fn bounded_json<T: serde::de::DeserializeOwned>(
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn consent_return_path_is_a_local_uuid_route() {
+        let id = Uuid::new_v4();
+        let path = format!("/cloud/authorize/{id}");
+        assert_eq!(safe_return_to(Some(&path)), path);
+        for value in [
+            "//attacker.example",
+            "/\\attacker.example",
+            "/cloud/authorize/not-a-uuid",
+            "/cloud/authorize/../login",
+            "https://attacker.example",
+        ] {
+            assert_eq!(safe_return_to(Some(value)), "/");
+        }
+    }
     #[test]
     fn validates_provider_origin_and_https_callbacks() {
         let mut config = SsoConfig {

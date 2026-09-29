@@ -45,6 +45,22 @@ pub fn router(state: AppState) -> Router {
         .route("/v2/", get(distribution_version))
         .route("/v2/{*path}", any(oci_route))
         .route("/auth/token", get(token))
+        .route(
+            "/api/v1/cloud-grants/requests",
+            post(crate::cloud_grants::create_request),
+        )
+        .route(
+            "/api/v1/cloud-grants/requests/{id}",
+            get(crate::cloud_grants::request_details),
+        )
+        .route(
+            "/api/v1/cloud-grants/requests/{id}/decision",
+            post(crate::cloud_grants::decision),
+        )
+        .route(
+            "/api/v1/cloud-grants/exchange",
+            post(crate::cloud_grants::exchange),
+        )
         .route("/api/v1/auth/sso/config", get(crate::sso::configuration))
         .route("/api/v1/auth/sso/start", get(crate::sso::start))
         .route("/api/v1/auth/sso/callback", get(crate::sso::callback))
@@ -161,7 +177,7 @@ async fn control_body_limit(
     next.run(request).await
 }
 
-fn allowed_origin(state: &AppState, origin: &str) -> bool {
+pub(crate) fn allowed_origin(state: &AppState, origin: &str) -> bool {
     if state
         .config
         .control_plane_origins
@@ -1728,7 +1744,7 @@ fn basic_credentials(headers: &HeaderMap) -> Option<(String, String)> {
     Some((username.to_owned(), password.to_owned()))
 }
 
-fn cookie_value(headers: &HeaderMap) -> Option<&str> {
+pub(crate) fn cookie_value(headers: &HeaderMap) -> Option<&str> {
     let value = headers.get(COOKIE)?.to_str().ok()?;
     value
         .split(';')
@@ -1766,7 +1782,7 @@ fn expired_session_cookie(state: &AppState) -> HeaderValue {
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use axum::{
         Router,
         body::{Body, to_bytes},
@@ -1949,7 +1965,7 @@ mod tests {
         task.abort();
     }
 
-    fn test_config() -> AppConfig {
+    pub(crate) fn test_config() -> AppConfig {
         AppConfig {
             sso: None,
             environment: AppEnvironment::Development,

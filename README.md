@@ -74,3 +74,11 @@ sign-in after a Registry process restart. Central SSO is disabled by default.
 
 Cloud authorization and live end-to-end verification are still pending;
 these code changes do not prove production SSO is active.
+
+### Cloud pull authorization
+
+With Accounts SSO enabled, Cloud can request explicit, repository-scoped pull consent. `POST /api/v1/cloud-grants/requests` accepts `client_id=knotree-cloud`, the exact callback `https://cloud.knotree.com/api/v1/auth/knotree-registry/callback`, a random `state` (32–128 URL-safe characters), `repository`, `code_challenge`, `code_challenge_method=S256`, and `expected_issuer`/`expected_subject` from the Cloud Accounts identity. The result contains `request_id`, `authorization_url` and `expires_in=600`. Only that federated identity with access to that repository may review and decide the request at `/cloud/authorize/{request_id}`. SSO preserves only this local UUID route as its return path.
+
+The browser posts `{ "allow": true }` or `{ "allow": false }` to `/api/v1/cloud-grants/requests/{id}/decision` with its Registry session and same-origin Origin header. It receives a callback URL with state and a single-use code, or `error=access_denied`. Cloud exchanges the code using `POST /api/v1/cloud-grants/exchange` with `client_id`, `redirect_uri`, `code`, `code_verifier`. The server verifies S256 PKCE and the live approving session before minting a pull-only credential lasting 30 days. The no-store JSON response contains username, credential, credential_id, exact repository, Accounts issuer/subject, expiry and `actions=["pull"]`. Cloud must validate these fields and encrypt the credential; never place it in browser storage or callback URLs. Users revoke credentials in Access Tokens.
+
+Pending requests and codes are bounded to 4096 entries, kept in memory and expire after ten/two minutes; restart invalidates pending consent. No credential exists until code exchange. The callback/client pair is fixed; custom Cloud domains require a reviewed server-side allowlist change. This local implementation still requires GitHub backend CI and live consent/pull/revocation testing before production enablement.

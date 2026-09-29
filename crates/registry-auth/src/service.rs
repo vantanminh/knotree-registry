@@ -598,6 +598,21 @@ impl AuthService {
             .ok_or(AuthError::InvalidSession)
     }
 
+    pub async fn federated_identity_for_session(
+        &self,
+        token: &str,
+    ) -> Result<(String, String), AuthError> {
+        let user_id = self.session_user_id(token).await?;
+        self.state
+            .read()
+            .await
+            .users
+            .values()
+            .find(|user| user.id == user_id)
+            .and_then(|user| user.federated_identity.clone())
+            .ok_or(AuthError::NoAccess)
+    }
+
     pub async fn create_credential_for_session(
         &self,
         session_token: &str,

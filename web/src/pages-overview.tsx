@@ -260,9 +260,11 @@ export function ActivityPage() {
 }
 
 export function LoginPage({
-  onLogin
+  onLogin,
+  returnTo = "/"
 }: {
   onLogin: () => void;
+  returnTo?: string;
 }) {
   const [ssoEnabled, setSsoEnabled] = useState(false);
   useEffect(() => {
@@ -301,7 +303,7 @@ export function LoginPage({
         <div className="brand-mark">K</div>
         <h1>Sign in</h1>
         <p className="lede">Knotree Registry</p>
-        {ssoEnabled && <a className="btn full" href="/api/v1/auth/sso/start">Continue with Knotree</a>}
+        {ssoEnabled && <a className="btn full" href={`/api/v1/auth/sso/start?returnTo=${encodeURIComponent(returnTo)}`}>Continue with Knotree</a>}
         <form className="stack" onSubmit={submit}>
           <label className="field">
             <span>Username / Email</span>

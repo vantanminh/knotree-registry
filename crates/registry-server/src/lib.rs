@@ -1,4 +1,5 @@
 mod catalog;
+mod cloud_grants;
 mod config;
 mod error;
 mod metrics;
