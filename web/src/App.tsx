@@ -10,7 +10,6 @@ import {
   LayoutDashboard,
   Menu,
   Moon,
-  Server,
   Settings,
   Sun,
   Terminal,
@@ -20,10 +19,12 @@ import {
   Webhook,
   HardDrive,
   ScrollText,
+  Cloud,
   CircleDot
 } from "lucide-react";
 import { Instance, User, api, friendlyError } from "./api";
 import { CloudAuthorizationPage } from "./cloud-authorization";
+import { CloudConnectionPage } from "./pages-cloud";
 import { LoginPage, OverviewPage, StatusPage, ActivityPage } from "./pages-overview";
 import { NamespacesPage, RepositoriesPage, RepositoryDetailPage } from "./pages-repos";
 import { TokenDetailPage, TokensPage } from "./pages-tokens";
@@ -31,7 +32,6 @@ import {
   AuditPage,
   GarbageCollectionPage,
   MembersPage,
-  PlaceholderPage,
   SecuritySettingsPage,
   SettingsPage,
   StoragePage,
@@ -55,8 +55,7 @@ const nav: { label: string; items: NavItem[] }[] = [
   {
     label: "Deployments",
     items: [
-      { to: "/deployments/watchers", label: "Watchers", icon: CircleDot },
-      { to: "/deployments/agents", label: "Agents", icon: Server }
+      { to: "/deployments/cloud", label: "Knotree Cloud", icon: Cloud }
     ]
   },
   {
@@ -93,8 +92,9 @@ export default function App() {
             <Route path="/namespaces" element={<NamespacesPage />} />
             <Route path="/namespaces/members" element={<MembersPage />} />
             <Route path="/uploads" element={<UploadsRoute />} />
-            <Route path="/deployments/watchers" element={<PlaceholderPage title="Watchers" text="Deployment watchers track a tag or digest on a target host. No watchers are registered on this instance." />} />
-            <Route path="/deployments/agents" element={<PlaceholderPage title="Agents" text="VPS agents report heartbeat and desired digest. Agent registration is not enabled on this control plane." />} />
+            <Route path="/deployments/cloud" element={<CloudRoute />} />
+            <Route path="/deployments/watchers" element={<Navigate to="/deployments/cloud" replace />} />
+            <Route path="/deployments/agents" element={<Navigate to="/deployments/cloud" replace />} />
             <Route path="/activity" element={<ActivityPage />} />
             <Route path="/operations/storage" element={<StoragePage />} />
             <Route path="/operations/webhooks" element={<WebhooksRoute />} />
@@ -433,6 +433,9 @@ function TokensRoute() {
 }
 function UploadsRoute() {
   return <UploadsPage admin={useSessionUser().is_admin} />;
+}
+function CloudRoute() {
+  return <CloudConnectionPage admin={useSessionUser().is_admin} host={useHost()} />;
 }
 function WebhooksRoute() {
   return <WebhooksPage admin={useSessionUser().is_admin} />;
