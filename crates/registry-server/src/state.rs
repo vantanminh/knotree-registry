@@ -6,7 +6,8 @@ use std::{
 use registry_auth::AuthService;
 use registry_db::Database;
 use registry_events::{
-    DeliveryDecision, EventLog, PendingWebhookDelivery, RetryPolicy, WebhookRegistry,
+    DeliveryDecision, DeliveryOutcome, EventLog, PendingWebhookDelivery, RetryPolicy,
+    WebhookRegistry,
 };
 use registry_storage::{DynObjectStore, LocalFileStore, MemoryObjectStore, R2ObjectStore};
 use serde::{Deserialize, Serialize};
@@ -252,7 +253,24 @@ impl AppState {
                     let attempt = pending.attempt.saturating_add(1);
                     let result = send_webhook(&client, &pending, attempt).await;
                     let status = result.as_ref().copied().map_err(|_| "request failed");
-                    match policy.next_attempt(attempt, status, now) {
+                    let decision = policy.next_attempt(attempt, status, now);
+                    let outcome = match decision {
+                        DeliveryDecision::Succeeded => DeliveryOutcome::Delivered,
+                        DeliveryDecision::Retry { .. } => DeliveryOutcome::Retrying,
+                        DeliveryDecision::Failed { .. } => DeliveryOutcome::Failed,
+                    };
+                    state
+                        .webhooks
+                        .record_attempt(
+                            &pending,
+                            attempt,
+                            result.as_ref().ok().copied(),
+                            outcome,
+                            result.as_ref().err().cloned(),
+                            now,
+                        )
+                        .await;
+                    match decision {
                         DeliveryDecision::Succeeded => {
                             state.webhooks.complete(pending.delivery.id).await;
                             tracing::debug!(

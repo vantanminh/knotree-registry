@@ -1,7 +1,7 @@
 //! Durable event and webhook-delivery primitives shared by the server and agent.
 
 use std::{
-    collections::{BTreeSet, HashMap},
+    collections::{BTreeSet, HashMap, VecDeque},
     sync::Arc,
     time::{Duration, SystemTime, UNIX_EPOCH},
 };
@@ -79,10 +79,42 @@ pub struct WebhookCreated {
     pub secret: String,
 }
 
+/// Stable ID of the operator-managed Knotree Cloud endpoint.
+pub const CLOUD_WEBHOOK_ID: Uuid = Uuid::from_u128(0x3de45586_d014_4c43_ba11_10f019bc94f5);
+
+/// Delivery attempts kept for the dashboard, newest last.
+pub const DELIVERY_HISTORY_LIMIT: usize = 100;
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum DeliveryOutcome {
+    Delivered,
+    Retrying,
+    Failed,
+}
+
+/// One webhook delivery attempt as shown to operators. Never contains the
+/// signing secret or the signed body.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct DeliveryRecord {
+    pub delivery_id: Uuid,
+    pub webhook_id: Uuid,
+    pub event: EventKind,
+    pub repository: Option<String>,
+    pub tag: Option<String>,
+    pub digest: Option<String>,
+    pub attempt: u32,
+    pub status: Option<u16>,
+    pub outcome: DeliveryOutcome,
+    pub error: Option<String>,
+    pub at: u64,
+}
+
 #[derive(Clone, Default)]
 pub struct WebhookRegistry {
     endpoints: Arc<RwLock<HashMap<Uuid, WebhookEndpoint>>>,
     deliveries: Arc<RwLock<HashMap<Uuid, PendingWebhookDelivery>>>,
+    history: Arc<RwLock<VecDeque<DeliveryRecord>>>,
 }
 
 #[derive(Clone, Serialize, Deserialize)]
@@ -105,6 +137,8 @@ struct WebhookSnapshot {
     endpoints: Vec<WebhookEndpoint>,
     #[serde(default)]
     deliveries: Vec<PendingWebhookDelivery>,
+    #[serde(default)]
+    history: Vec<DeliveryRecord>,
 }
 
 #[derive(Deserialize)]
@@ -130,7 +164,7 @@ impl WebhookRegistry {
         {
             return Err(WebhookError::InvalidUrl);
         }
-        let id = Uuid::from_u128(0x3de45586_d014_4c43_ba11_10f019bc94f5);
+        let id = CLOUD_WEBHOOK_ID;
         let mut endpoints = self.endpoints.write().await;
         let created_at = endpoints
             .get(&id)
@@ -163,6 +197,7 @@ impl WebhookRegistry {
             WebhookSnapshotInput::Legacy(endpoints) => WebhookSnapshot {
                 endpoints,
                 deliveries: Vec::new(),
+                history: Vec::new(),
             },
         };
         let endpoints = snapshot
@@ -175,9 +210,14 @@ impl WebhookRegistry {
             .into_iter()
             .map(|delivery| (delivery.delivery.id, delivery))
             .collect();
+        let mut history: VecDeque<DeliveryRecord> = snapshot.history.into();
+        while history.len() > DELIVERY_HISTORY_LIMIT {
+            history.pop_front();
+        }
         Ok(Self {
             endpoints: Arc::new(RwLock::new(endpoints)),
             deliveries: Arc::new(RwLock::new(deliveries)),
+            history: Arc::new(RwLock::new(history)),
         })
     }
 
@@ -185,6 +225,7 @@ impl WebhookRegistry {
         serde_json::to_value(WebhookSnapshot {
             endpoints: self.endpoints.read().await.values().cloned().collect(),
             deliveries: self.deliveries.read().await.values().cloned().collect(),
+            history: self.history.read().await.iter().cloned().collect(),
         })
     }
 
@@ -324,6 +365,59 @@ impl WebhookRegistry {
         delivery.attempt = attempt;
         delivery.next_attempt_at = next_attempt_at;
         true
+    }
+
+    /// Remember one delivery attempt for the dashboard, bounded to
+    /// [`DELIVERY_HISTORY_LIMIT`] entries.
+    pub async fn record_attempt(
+        &self,
+        pending: &PendingWebhookDelivery,
+        attempt: u32,
+        status: Option<u16>,
+        outcome: DeliveryOutcome,
+        error: Option<String>,
+        at: u64,
+    ) {
+        let event = &pending.delivery.event;
+        let mut history = self.history.write().await;
+        history.push_back(DeliveryRecord {
+            delivery_id: pending.delivery.id,
+            webhook_id: pending.webhook_id,
+            event: event.kind.clone(),
+            repository: event.repository.clone(),
+            tag: event.tag.clone(),
+            digest: event.digest.clone(),
+            attempt,
+            status,
+            outcome,
+            error: error.map(|e| e.chars().take(200).collect()),
+            at,
+        });
+        while history.len() > DELIVERY_HISTORY_LIMIT {
+            history.pop_front();
+        }
+    }
+
+    /// Most recent attempts first, optionally for one endpoint.
+    pub async fn history(&self, webhook_id: Option<Uuid>, limit: usize) -> Vec<DeliveryRecord> {
+        self.history
+            .read()
+            .await
+            .iter()
+            .rev()
+            .filter(|record| webhook_id.is_none_or(|id| record.webhook_id == id))
+            .take(limit)
+            .cloned()
+            .collect()
+    }
+
+    pub async fn pending_for(&self, webhook_id: Uuid) -> usize {
+        self.deliveries
+            .read()
+            .await
+            .values()
+            .filter(|delivery| delivery.webhook_id == webhook_id)
+            .count()
     }
 
     pub async fn pending_count(&self) -> usize {
@@ -710,5 +804,52 @@ mod tests {
         let registry = WebhookRegistry::from_snapshot(endpoint).expect("legacy snapshot");
         assert_eq!(registry.list().await.len(), 0);
         assert_eq!(registry.pending_count().await, 0);
+    }
+
+    #[tokio::test]
+    async fn delivery_history_is_bounded_and_survives_snapshot() {
+        let registry = WebhookRegistry::default();
+        registry
+            .configure_cloud(
+                "https://cloud.knotree.com/api/v1/public/webhooks/knotree-registry".into(),
+                "s".repeat(32),
+            )
+            .await
+            .unwrap();
+        let mut event = RegistryEvent::new(EventKind::TagUpdated);
+        event.repository = Some("team/app".into());
+        event.tag = Some("main".into());
+        assert_eq!(registry.enqueue(event).await, 1);
+        let pending = registry.due_deliveries(now_seconds()).await.remove(0);
+        assert_eq!(registry.pending_for(CLOUD_WEBHOOK_ID).await, 1);
+        for attempt in 0..(DELIVERY_HISTORY_LIMIT as u32 + 5) {
+            registry
+                .record_attempt(
+                    &pending,
+                    attempt,
+                    Some(503),
+                    DeliveryOutcome::Retrying,
+                    None,
+                    1,
+                )
+                .await;
+        }
+        registry
+            .record_attempt(
+                &pending,
+                999,
+                Some(202),
+                DeliveryOutcome::Delivered,
+                None,
+                2,
+            )
+            .await;
+        let history = registry.history(Some(CLOUD_WEBHOOK_ID), 500).await;
+        assert_eq!(history.len(), DELIVERY_HISTORY_LIMIT);
+        assert_eq!(history[0].outcome, DeliveryOutcome::Delivered);
+        assert_eq!(history[0].repository.as_deref(), Some("team/app"));
+        let restored = WebhookRegistry::from_snapshot(registry.snapshot().await.unwrap()).unwrap();
+        assert_eq!(restored.history(None, 1).await[0].attempt, 999);
+        assert!(registry.history(Some(Uuid::new_v4()), 10).await.is_empty());
     }
 }
