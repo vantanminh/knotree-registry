@@ -1,6 +1,6 @@
 import { FormEvent, useEffect, useMemo, useState } from "react";
 import { QRCodeCanvas } from "qrcode.react";
-import { useSearchParams } from "react-router-dom";
+import { Link, useSearchParams } from "react-router-dom";
 import {
   AuditEvent,
   GcReport,
@@ -375,13 +375,17 @@ export function UploadsPage({ admin }: { admin: boolean }) {
 
 export function WebhooksPage({ admin }: { admin: boolean }) {
   const [webhooks, setWebhooks] = useState<Webhook[] | null>(null);
+  const [managedId, setManagedId] = useState("");
   const [error, setError] = useState("");
   const [url, setUrl] = useState("");
   const [secret, setSecret] = useState("");
   const toast = useToast();
   function load() {
-    api<{ webhooks: Webhook[] }>("/api/v1/webhooks")
-      .then((result) => setWebhooks(result.webhooks))
+    api<{ webhooks: Webhook[]; managed_webhook_id?: string }>("/api/v1/webhooks")
+      .then((result) => {
+        setWebhooks(result.webhooks);
+        setManagedId(result.managed_webhook_id ?? "");
+      })
       .catch((reason) => setError(friendlyError(reason)));
   }
   useEffect(load, []);
@@ -438,7 +442,14 @@ export function WebhooksPage({ admin }: { admin: boolean }) {
               <tbody>
                 {webhooks.map((webhook) => (
                   <tr key={webhook.id}>
-                    <td className="mono">{webhook.url}</td>
+                    <td className="mono">
+                      {webhook.url}
+                      {webhook.id === managedId && (
+                        <Link to="/deployments/cloud" style={{ marginLeft: 8 }}>
+                          <StatusBadge state="info" label="Managed · Knotree Cloud" />
+                        </Link>
+                      )}
+                    </td>
                     <td>{webhook.events.join(", ") || "all events"}</td>
                     <td>
                       <StatusBadge state={webhook.enabled ? "ok" : "fail"} label={webhook.enabled ? "Active" : "Disabled"} />
@@ -447,7 +458,7 @@ export function WebhooksPage({ admin }: { admin: boolean }) {
                       <RelativeTime value={webhook.created_at} />
                     </td>
                     <td>
-                      {admin && webhook.enabled && (
+                      {admin && webhook.enabled && webhook.id !== managedId && (
                         <button
                           className="btn sm danger"
                           onClick={async () => {

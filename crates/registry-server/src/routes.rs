@@ -83,6 +83,8 @@ pub fn router(state: AppState) -> Router {
         .route("/api/v1/uploads", get(list_uploads))
         .route("/api/v1/webhooks", get(list_webhooks).post(create_webhook))
         .route("/api/v1/webhooks/{id}/disable", post(disable_webhook))
+        .route("/api/v1/webhooks/deliveries", get(webhook_deliveries))
+        .route("/api/v1/integrations/cloud", get(cloud_integration))
         .route("/api/v1/admin/gc", post(run_gc));
     let router = if let Some(root) = state.config.static_root.clone() {
         router.fallback_service(
@@ -1580,7 +1582,52 @@ async fn list_webhooks(
     if !user.is_admin {
         return Err(registry_auth::AuthError::NoAccess.into());
     }
-    Ok(Json(json!({"webhooks": state.webhooks.list().await})))
+    Ok(Json(json!({
+        "webhooks": state.webhooks.list().await,
+        "managed_webhook_id": registry_events::CLOUD_WEBHOOK_ID,
+    })))
+}
+
+async fn webhook_deliveries(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+) -> Result<impl IntoResponse, crate::AppError> {
+    let session = cookie_value(&headers).ok_or(registry_auth::AuthError::InvalidSession)?;
+    let user = state.auth.session_user(session).await?;
+    if !user.is_admin {
+        return Err(registry_auth::AuthError::NoAccess.into());
+    }
+    Ok(Json(
+        json!({"deliveries": state.webhooks.history(None, 100).await}),
+    ))
+}
+
+/// Knotree Cloud auto-deploy status: the managed webhook, its queue and the
+/// most recent delivery attempts. Admin only; never returns the secret.
+async fn cloud_integration(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+) -> Result<impl IntoResponse, crate::AppError> {
+    let session = cookie_value(&headers).ok_or(registry_auth::AuthError::InvalidSession)?;
+    let user = state.auth.session_user(session).await?;
+    if !user.is_admin {
+        return Err(registry_auth::AuthError::NoAccess.into());
+    }
+    let id = registry_events::CLOUD_WEBHOOK_ID;
+    let webhook = state
+        .webhooks
+        .list()
+        .await
+        .into_iter()
+        .find(|webhook| webhook.id == id);
+    let deliveries = state.webhooks.history(Some(id), 25).await;
+    Ok(Json(json!({
+        "configured": webhook.as_ref().is_some_and(|webhook| webhook.enabled),
+        "webhook": webhook,
+        "pending": state.webhooks.pending_for(id).await,
+        "deliveries": deliveries,
+        "public_url": state.config.public_url,
+    })))
 }
 
 async fn create_webhook(
@@ -2233,6 +2280,27 @@ pub(crate) mod tests {
             .await
             .expect("body");
         assert!(!String::from_utf8_lossy(&listed_webhooks).contains("whsec_"));
+
+        let response = router(state.clone())
+            .oneshot(
+                Request::builder()
+                    .uri("/api/v1/integrations/cloud")
+                    .header("cookie", &cookie)
+                    .body(Body::empty())
+                    .expect("request"),
+            )
+            .await
+            .expect("response");
+        assert_eq!(response.status(), StatusCode::OK);
+        let cloud: serde_json::Value = serde_json::from_slice(
+            &to_bytes(response.into_body(), usize::MAX)
+                .await
+                .expect("body"),
+        )
+        .expect("cloud json");
+        assert_eq!(cloud["configured"], false);
+        assert!(cloud["deliveries"].as_array().is_some());
+        assert!(!cloud.to_string().contains("whsec_"));
 
         let response = router(state)
             .oneshot(

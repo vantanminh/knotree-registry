@@ -75,6 +75,10 @@ sign-in after a Registry process restart. Central SSO is disabled by default.
 Cloud authorization and live end-to-end verification are still pending;
 these code changes do not prove production SSO is active.
 
+### Knotree Cloud auto deploy
+
+**Deployments → Knotree Cloud** shows whether the managed `tag_updated` webhook to Cloud is configured, how many deliveries are queued, and the last 25 attempts with their HTTP status (the last 100 attempts across all webhooks are kept in the persisted runtime state and served at `GET /api/v1/webhooks/deliveries`). `GET /api/v1/integrations/cloud` returns the same status for admins and never includes the signing secret. To deploy on push, create a pull-only Access Token for the repository and connect it on the service page in Knotree Cloud; the managed webhook endpoint is marked as such on the Webhooks page and cannot be disabled from the dashboard.
+
 ### Cloud pull authorization
 
 With Accounts SSO enabled, Cloud can request explicit, repository-scoped pull consent. `POST /api/v1/cloud-grants/requests` accepts `client_id=knotree-cloud`, the exact callback `https://cloud.knotree.com/api/v1/auth/knotree-registry/callback`, a random `state` (32–128 URL-safe characters), `repository`, `code_challenge`, `code_challenge_method=S256`, and `expected_issuer`/`expected_subject` from the Cloud Accounts identity. The result contains `request_id`, `authorization_url` and `expires_in=600`. Only that federated identity with access to that repository may review and decide the request at `/cloud/authorize/{request_id}`. SSO preserves only this local UUID route as its return path.
