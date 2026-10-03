@@ -45,33 +45,11 @@ pub fn router(state: AppState) -> Router {
         .route("/v2/", get(distribution_version))
         .route("/v2/{*path}", any(oci_route))
         .route("/auth/token", get(token))
-        .route(
-            "/api/v1/cloud-grants/requests",
-            post(crate::cloud_grants::create_request),
-        )
-        .route(
-            "/api/v1/cloud-grants/requests/{id}",
-            get(crate::cloud_grants::request_details),
-        )
-        .route(
-            "/api/v1/cloud-grants/requests/{id}/decision",
-            post(crate::cloud_grants::decision),
-        )
-        .route(
-            "/api/v1/cloud-grants/exchange",
-            post(crate::cloud_grants::exchange),
-        )
         .route("/api/v1/auth/sso/config", get(crate::sso::configuration))
         .route("/api/v1/auth/sso/start", get(crate::sso::start))
         .route("/api/v1/auth/sso/callback", get(crate::sso::callback))
-        .route("/api/v1/auth/login", post(login))
         .route("/api/v1/auth/logout", post(logout))
         .route("/api/v1/auth/me", get(me))
-        .route("/api/v1/auth/password", post(change_password))
-        .route("/api/v1/auth/2fa", get(totp_status))
-        .route("/api/v1/auth/2fa/setup", post(begin_totp_setup))
-        .route("/api/v1/auth/2fa/confirm", post(confirm_totp_setup))
-        .route("/api/v1/auth/2fa/disable", post(disable_totp))
         .route("/api/v1/auth/tokens", get(list_tokens).post(create_token))
         .route("/api/v1/auth/tokens/{id}/revoke", post(revoke_token))
         .route("/api/v1/overview", get(overview))
@@ -85,14 +63,6 @@ pub fn router(state: AppState) -> Router {
         .route("/api/v1/webhooks/{id}/disable", post(disable_webhook))
         .route("/api/v1/webhooks/deliveries", get(webhook_deliveries))
         .route("/api/v1/integrations/cloud", get(cloud_integration))
-        .route(
-            "/api/v1/integrations/cloud/repositories",
-            get(integration_repositories),
-        )
-        .route(
-            "/api/v1/integrations/cloud/repositories/{*repository}",
-            get(integration_repository_tags),
-        )
         .route("/api/v1/admin/gc", post(run_gc));
     let router = if let Some(root) = state.config.static_root.clone() {
         router.fallback_service(
@@ -1265,144 +1235,6 @@ async fn token(
     })))
 }
 
-#[derive(Debug, Deserialize)]
-struct LoginRequest {
-    username: String,
-    password: String,
-    #[serde(default)]
-    otp: Option<String>,
-}
-
-async fn login(
-    State(state): State<AppState>,
-    Json(input): Json<LoginRequest>,
-) -> Result<Response, crate::AppError> {
-    let session = match state
-        .auth
-        .login_with_totp(&input.username, &input.password, input.otp.as_deref())
-        .await
-    {
-        Ok(session) => session,
-        Err(error) => {
-            let mut event = RegistryEvent::new(EventKind::LoginFailed);
-            event.actor = Some(input.username.clone());
-            state.record_event(event).await;
-            return Err(error.into());
-        }
-    };
-    let mut event = RegistryEvent::new(EventKind::LoginSucceeded);
-    event.actor = Some(input.username.clone());
-    state.record_event(event).await;
-    let mut response =
-        Json(json!({"user": session.user, "expires_at": session.expires_at})).into_response();
-    response.headers_mut().insert(
-        SET_COOKIE,
-        session_cookie(&state, &session.token, session.expires_at),
-    );
-    Ok(response)
-}
-
-#[derive(Debug, Deserialize)]
-struct ChangePasswordRequest {
-    current_password: String,
-    new_password: String,
-    confirm_password: String,
-}
-
-async fn change_password(
-    State(state): State<AppState>,
-    headers: HeaderMap,
-    Json(input): Json<ChangePasswordRequest>,
-) -> Result<Response, crate::AppError> {
-    if input.new_password != input.confirm_password {
-        return Err(crate::AppError::BadRequest("passwords do not match"));
-    }
-    let session_token = cookie_value(&headers).ok_or(registry_auth::AuthError::InvalidSession)?;
-    let session = state
-        .auth
-        .change_password(session_token, &input.current_password, &input.new_password)
-        .await?;
-    let mut event = RegistryEvent::new(EventKind::PasswordChanged);
-    event.actor = Some(session.user.username.clone());
-    state.record_event(event).await;
-    let mut response =
-        Json(json!({"user": session.user, "expires_at": session.expires_at})).into_response();
-    response.headers_mut().insert(
-        SET_COOKIE,
-        session_cookie(&state, &session.token, session.expires_at),
-    );
-    Ok(response)
-}
-
-async fn totp_status(
-    State(state): State<AppState>,
-    headers: HeaderMap,
-) -> Result<impl IntoResponse, crate::AppError> {
-    let session = cookie_value(&headers).ok_or(registry_auth::AuthError::InvalidSession)?;
-    Ok(Json(state.auth.totp_status(session).await?))
-}
-
-#[derive(Debug, Deserialize)]
-struct TotpSetupRequest {
-    password: String,
-}
-
-async fn begin_totp_setup(
-    State(state): State<AppState>,
-    headers: HeaderMap,
-    Json(input): Json<TotpSetupRequest>,
-) -> Result<impl IntoResponse, crate::AppError> {
-    let session = cookie_value(&headers).ok_or(registry_auth::AuthError::InvalidSession)?;
-    Ok(Json(
-        state
-            .auth
-            .begin_totp_setup(session, &input.password)
-            .await?,
-    ))
-}
-
-#[derive(Debug, Deserialize)]
-struct TotpCodeRequest {
-    code: String,
-}
-
-async fn confirm_totp_setup(
-    State(state): State<AppState>,
-    headers: HeaderMap,
-    Json(input): Json<TotpCodeRequest>,
-) -> Result<impl IntoResponse, crate::AppError> {
-    let session = cookie_value(&headers).ok_or(registry_auth::AuthError::InvalidSession)?;
-    let user = state.auth.session_user(session).await?;
-    let status = state.auth.confirm_totp_setup(session, &input.code).await?;
-    let mut event = RegistryEvent::new(EventKind::TwoFactorEnabled);
-    event.actor = Some(user.username);
-    state.record_event(event).await;
-    Ok(Json(status))
-}
-
-#[derive(Debug, Deserialize)]
-struct TotpDisableRequest {
-    password: String,
-    code: String,
-}
-
-async fn disable_totp(
-    State(state): State<AppState>,
-    headers: HeaderMap,
-    Json(input): Json<TotpDisableRequest>,
-) -> Result<impl IntoResponse, crate::AppError> {
-    let session = cookie_value(&headers).ok_or(registry_auth::AuthError::InvalidSession)?;
-    let user = state.auth.session_user(session).await?;
-    let status = state
-        .auth
-        .disable_totp(session, &input.password, &input.code)
-        .await?;
-    let mut event = RegistryEvent::new(EventKind::TwoFactorDisabled);
-    event.actor = Some(user.username);
-    state.record_event(event).await;
-    Ok(Json(status))
-}
-
 async fn logout(
     State(state): State<AppState>,
     headers: HeaderMap,
@@ -1569,45 +1401,6 @@ pub(crate) async fn repository_tags_json(
         }));
     }
     Ok(json!({"name": repository, "visibility": "private", "tags": entries}))
-}
-
-/// Authenticates Knotree Cloud with a namespace-scoped grant credential
-/// (HTTP Basic `<username>:<secret>`). The result is always the grant owner,
-/// so the integration API can only ever see that owner's namespace.
-async fn namespace_grant_user(
-    state: &AppState,
-    headers: &HeaderMap,
-) -> Result<registry_auth::UserSummary, crate::AppError> {
-    let (username, secret) =
-        basic_credentials(headers).ok_or(registry_auth::AuthError::InvalidCredentials)?;
-    Ok(state
-        .auth
-        .verify_namespace_credential(&username, &secret)
-        .await?)
-}
-
-async fn integration_repositories(
-    State(state): State<AppState>,
-    headers: HeaderMap,
-) -> Result<impl IntoResponse, crate::AppError> {
-    let user = namespace_grant_user(&state, &headers).await?;
-    Ok(Json(
-        json!({"namespace": user.username, "repositories": user_inventory(&state, &user).await.repositories}),
-    ))
-}
-
-async fn integration_repository_tags(
-    State(state): State<AppState>,
-    Path(repository): Path<String>,
-    headers: HeaderMap,
-) -> Result<impl IntoResponse, crate::AppError> {
-    let user = namespace_grant_user(&state, &headers).await?;
-    let repository = RepositoryName::parse(&repository)
-        .map_err(|_| crate::AppError::BadRequest("invalid repository name"))?;
-    if user.is_admin || !user.can_access_repository(&repository) {
-        return Err(registry_auth::AuthError::NoAccess.into());
-    }
-    Ok(Json(repository_tags_json(&state, &repository).await?))
 }
 
 #[derive(Debug, Deserialize)]
@@ -1822,9 +1615,11 @@ async fn grant_revoked_event(
     revoked: &registry_auth::RevokedCredential,
     actor: String,
 ) -> Option<RegistryEvent> {
+    // Credentials from the retired Cloud consent flow. Cloud still stops
+    // auto-deploys that use one when its owner revokes it here.
     let is_cloud_grant = revoked.namespace_pull.is_some()
-        || revoked.name == crate::cloud_grants::REPOSITORY_GRANT_NAME
-        || revoked.name == crate::cloud_grants::NAMESPACE_GRANT_NAME;
+        || revoked.name == "Knotree Cloud pull authorization"
+        || revoked.name == "Knotree Cloud account connection";
     if !is_cloud_grant {
         return None;
     }
@@ -2130,8 +1925,6 @@ pub(crate) mod tests {
             token_issuer: "knotree-registry".to_owned(),
             token_service: "knotree-registry".to_owned(),
             token_ttl_seconds: 300,
-            bootstrap_admin_username: None,
-            bootstrap_admin_password: None,
             cookie_secure: false,
             r2_endpoint: None,
             r2_bucket: None,
@@ -2228,36 +2021,12 @@ pub(crate) mod tests {
     #[tokio::test]
     async fn control_plane_session_and_token_lifecycle_is_cookie_scoped() {
         let state = AppState::initialize(test_config()).await.expect("state");
-        state
+        let session = state
             .auth
-            .bootstrap_admin("admin", "correct horse battery staple")
+            .login_federated_as("https://accounts.knotree.com", "ops", true)
             .await
-            .expect("bootstrap");
-
-        let response = router(state.clone())
-            .oneshot(
-                Request::builder()
-                    .method("POST")
-                    .uri("/api/v1/auth/login")
-                    .header("content-type", "application/json")
-                    .body(Body::from(
-                        r#"{"username":"admin","password":"correct horse battery staple"}"#,
-                    ))
-                    .expect("request"),
-            )
-            .await
-            .expect("response");
-        assert_eq!(response.status(), StatusCode::OK);
-        let cookie = response
-            .headers()
-            .get("set-cookie")
-            .expect("session cookie")
-            .to_str()
-            .expect("cookie header")
-            .split(';')
-            .next()
-            .expect("cookie pair")
-            .to_owned();
+            .expect("sso admin");
+        let cookie = format!("kntr_session={}", session.token);
 
         let response = router(state.clone())
             .oneshot(
@@ -2415,132 +2184,6 @@ pub(crate) mod tests {
             .await
             .expect("response");
         assert_eq!(response.status(), StatusCode::NO_CONTENT);
-    }
-
-    #[tokio::test]
-    async fn account_security_routes_change_password_and_start_totp_setup() {
-        let state = AppState::initialize(test_config()).await.expect("state");
-        state
-            .auth
-            .bootstrap_admin("admin", "correct horse battery staple")
-            .await
-            .expect("bootstrap");
-        let response = router(state.clone())
-            .oneshot(
-                Request::builder()
-                    .method("POST")
-                    .uri("/api/v1/auth/login")
-                    .header("content-type", "application/json")
-                    .body(Body::from(
-                        r#"{"username":"admin","password":"correct horse battery staple"}"#,
-                    ))
-                    .expect("request"),
-            )
-            .await
-            .expect("response");
-        let cookie = response
-            .headers()
-            .get("set-cookie")
-            .expect("session cookie")
-            .to_str()
-            .expect("cookie header")
-            .split(';')
-            .next()
-            .expect("cookie pair")
-            .to_owned();
-
-        let response = router(state.clone())
-            .oneshot(
-                Request::builder()
-                    .method("POST")
-                    .uri("/api/v1/auth/password")
-                    .header("content-type", "application/json")
-                    .header("cookie", &cookie)
-                    .body(Body::from(
-                        r#"{"current_password":"correct horse battery staple","new_password":"a different secure password","confirm_password":"a different secure password"}"#,
-                    ))
-                    .expect("request"),
-            )
-            .await
-            .expect("response");
-        assert_eq!(response.status(), StatusCode::OK);
-        let new_cookie = response
-            .headers()
-            .get("set-cookie")
-            .expect("rotated session cookie")
-            .to_str()
-            .expect("cookie header")
-            .split(';')
-            .next()
-            .expect("cookie pair")
-            .to_owned();
-        assert_ne!(cookie, new_cookie);
-
-        let response = router(state.clone())
-            .oneshot(
-                Request::builder()
-                    .uri("/api/v1/auth/2fa")
-                    .header("cookie", &new_cookie)
-                    .body(Body::empty())
-                    .expect("request"),
-            )
-            .await
-            .expect("response");
-        assert_eq!(response.status(), StatusCode::OK);
-        let status: serde_json::Value = serde_json::from_slice(
-            &to_bytes(response.into_body(), usize::MAX)
-                .await
-                .expect("body"),
-        )
-        .expect("status json");
-        assert_eq!(status["enabled"], false);
-
-        let response = router(state.clone())
-            .oneshot(
-                Request::builder()
-                    .method("POST")
-                    .uri("/api/v1/auth/2fa/setup")
-                    .header("content-type", "application/json")
-                    .header("cookie", &new_cookie)
-                    .body(Body::from(r#"{"password":"a different secure password"}"#))
-                    .expect("request"),
-            )
-            .await
-            .expect("response");
-        assert_eq!(response.status(), StatusCode::OK);
-        let setup: serde_json::Value = serde_json::from_slice(
-            &to_bytes(response.into_body(), usize::MAX)
-                .await
-                .expect("body"),
-        )
-        .expect("setup json");
-        assert_eq!(setup["secret"].as_str().map(str::len), Some(32));
-        assert!(
-            setup["otpauth_uri"]
-                .as_str()
-                .is_some_and(|uri| uri.starts_with("otpauth://totp/"))
-        );
-
-        let response = router(state)
-            .oneshot(
-                Request::builder()
-                    .method("POST")
-                    .uri("/api/v1/auth/2fa/confirm")
-                    .header("content-type", "application/json")
-                    .header("cookie", &new_cookie)
-                    .body(Body::from(r#"{"code":"000000"}"#))
-                    .expect("request"),
-            )
-            .await
-            .expect("response");
-        assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
-        let error: serde_json::Value = serde_json::from_slice(
-            &to_bytes(response.into_body(), usize::MAX)
-                .await
-                .expect("body"),
-        )
-        .expect("error json");
-        assert_eq!(error["error"], "two_factor_invalid");
     }
 
     #[tokio::test]

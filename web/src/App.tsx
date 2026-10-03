@@ -23,7 +23,6 @@ import {
   CircleDot
 } from "lucide-react";
 import { Instance, User, api, friendlyError } from "./api";
-import { CloudAuthorizationPage } from "./cloud-authorization";
 import { CloudConnectionPage } from "./pages-cloud";
 import { LoginPage, OverviewPage, StatusPage, ActivityPage } from "./pages-overview";
 import { NamespacesPage, RepositoriesPage, RepositoryDetailPage } from "./pages-repos";
@@ -84,7 +83,6 @@ export default function App() {
       <Routes>
         <Route path="/login" element={<AuthGate />} />
         <Route element={<RequireAuth />}>
-          <Route path="/cloud/authorize/:requestId" element={<CloudAuthorizationPage />} />
           <Route element={<Shell />}>
             <Route path="/" element={<OverviewRoute />} />
             <Route path="/repositories" element={<ReposRoute />} />
@@ -131,12 +129,7 @@ function AuthGate() {
   if (user === undefined) return <div className="auth-shell">Loading…</div>;
   if (user) return <Navigate to={safeReturnTo(params.get("returnTo"))} replace />;
   return (
-    <LoginPage
-      returnTo={safeReturnTo(params.get("returnTo"))}
-      onLogin={() => {
-        window.location.assign(safeReturnTo(params.get("returnTo")));
-      }}
-    />
+    <LoginPage returnTo={safeReturnTo(params.get("returnTo"))} />
   );
 }
 

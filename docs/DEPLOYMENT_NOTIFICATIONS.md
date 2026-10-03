@@ -60,8 +60,9 @@ for account connections only when these match the connected Cloud user, so a
 repository name alone is never trusted as proof of ownership.
 
 The operator-managed Cloud webhook also receives `grant_revoked` when a user
-revokes a credential that was issued to Knotree Cloud through a consent grant
-(a namespace connection or a repository authorization). Its metadata holds
+revokes a credential that was issued to Knotree Cloud through the retired
+consent grant (a namespace connection or a repository authorization). New
+Cloud credentials come from the internal API and are renewed by Cloud. Its metadata holds
 `credential_id`, `namespace` and, for SSO users, `owner_issuer` and
 `owner_subject`. Cloud marks the matching connection revoked and turns off
 auto-deploy for the apps that used it. Revoking an ordinary access token does

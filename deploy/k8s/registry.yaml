@@ -224,16 +224,6 @@ spec:
                 secretKeyRef:
                   name: registry-app
                   key: DATABASE_URL
-            - name: BOOTSTRAP_ADMIN_USERNAME
-              valueFrom:
-                secretKeyRef:
-                  name: registry-app
-                  key: BOOTSTRAP_ADMIN_USERNAME
-            - name: BOOTSTRAP_ADMIN_PASSWORD
-              valueFrom:
-                secretKeyRef:
-                  name: registry-app
-                  key: BOOTSTRAP_ADMIN_PASSWORD
             - name: STORAGE_BACKEND
               valueFrom:
                 configMapKeyRef:
