@@ -553,12 +553,7 @@ mod flow_tests {
         );
     }
 
-    async fn get_basic(
-        app: axum::Router,
-        path: &str,
-        username: &str,
-        secret: &str,
-    ) -> StatusCode {
+    async fn get_basic(app: axum::Router, path: &str, username: &str, secret: &str) -> StatusCode {
         use base64::engine::general_purpose::STANDARD;
         let basic = STANDARD.encode(format!("{username}:{secret}"));
         app.oneshot(
@@ -601,16 +596,27 @@ mod flow_tests {
         both["namespace"] = json!(true);
         both["repository"] = json!(format!("{}/app", alice.user.username));
         assert_eq!(
-            json_response(app.clone(), "/api/v1/cloud-grants/requests", both, None, None)
-                .await
-                .0,
+            json_response(
+                app.clone(),
+                "/api/v1/cloud-grants/requests",
+                both,
+                None,
+                None
+            )
+            .await
+            .0,
             StatusCode::BAD_REQUEST
         );
         let mut request = base.clone();
         request["namespace"] = json!(true);
-        let (status, created) =
-            json_response(app.clone(), "/api/v1/cloud-grants/requests", request, None, None)
-                .await;
+        let (status, created) = json_response(
+            app.clone(),
+            "/api/v1/cloud-grants/requests",
+            request,
+            None,
+            None,
+        )
+        .await;
         assert_eq!(status, StatusCode::OK);
         let decision_path = format!(
             "/api/v1/cloud-grants/requests/{}/decision",
@@ -646,7 +652,13 @@ mod flow_tests {
         let secret = grant["credential"].as_str().unwrap();
         let ns = alice.user.username.as_str();
         assert_eq!(
-            get_basic(app.clone(), "/api/v1/integrations/cloud/repositories", ns, secret).await,
+            get_basic(
+                app.clone(),
+                "/api/v1/integrations/cloud/repositories",
+                ns,
+                secret
+            )
+            .await,
             StatusCode::OK
         );
         assert_ne!(
@@ -662,7 +674,10 @@ mod flow_tests {
         assert_eq!(
             get_basic(
                 app.clone(),
-                &format!("/api/v1/integrations/cloud/repositories/{}/app", bob.user.username),
+                &format!(
+                    "/api/v1/integrations/cloud/repositories/{}/app",
+                    bob.user.username
+                ),
                 ns,
                 secret
             )
@@ -684,7 +699,13 @@ mod flow_tests {
             .await
             .unwrap();
         assert_ne!(
-            get_basic(app, "/api/v1/integrations/cloud/repositories", ns, &pat.secret).await,
+            get_basic(
+                app,
+                "/api/v1/integrations/cloud/repositories",
+                ns,
+                &pat.secret
+            )
+            .await,
             StatusCode::OK
         );
     }

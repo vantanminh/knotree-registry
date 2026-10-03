@@ -1041,7 +1041,8 @@ fn intersect_namespace_pull(namespace: &str, requested: &[RepositoryScope]) -> V
     requested
         .iter()
         .filter(|wanted| {
-            wanted.repository.as_str().starts_with(&prefix) && wanted.actions.contains(&Action::Pull)
+            wanted.repository.as_str().starts_with(&prefix)
+                && wanted.actions.contains(&Action::Pull)
         })
         .map(|wanted| AccessEntry {
             typ: "repository".to_owned(),
@@ -1302,9 +1303,14 @@ mod tests {
             .await
             .expect("pull in own namespace");
         let repository = RepositoryName::parse(&format!("{ns}/new-app")).unwrap();
-        assert!(auth.verify_bearer(&minted.token, &repository, Action::Pull).await.is_ok());
+        assert!(
+            auth.verify_bearer(&minted.token, &repository, Action::Pull)
+                .await
+                .is_ok()
+        );
         assert!(matches!(
-            auth.verify_bearer(&minted.token, &repository, Action::Push).await,
+            auth.verify_bearer(&minted.token, &repository, Action::Push)
+                .await,
             Err(AuthError::NoAccess)
         ));
         let other = format!("{}/app", bob.user.username);
@@ -1338,7 +1344,8 @@ mod tests {
         );
         auth.revoke_credential(credential.id).await.unwrap();
         assert!(matches!(
-            auth.verify_namespace_credential(&ns, &credential.secret).await,
+            auth.verify_namespace_credential(&ns, &credential.secret)
+                .await,
             Err(AuthError::CredentialRevoked)
         ));
     }
