@@ -40,8 +40,6 @@ pub struct AppConfig {
     pub token_issuer: String,
     pub token_service: String,
     pub token_ttl_seconds: u64,
-    pub bootstrap_admin_username: Option<String>,
-    pub bootstrap_admin_password: Option<String>,
     pub cookie_secure: bool,
     pub r2_endpoint: Option<String>,
     pub r2_bucket: Option<String>,
@@ -86,8 +84,6 @@ pub enum ConfigError {
     PullMode(String),
     #[error("edge pull mode requires EDGE_DOWNLOAD_URL and EDGE_DOWNLOAD_SECRET")]
     EdgeUnavailable,
-    #[error("BOOTSTRAP_ADMIN_USERNAME and BOOTSTRAP_ADMIN_PASSWORD must be set together")]
-    BootstrapCredentialsIncomplete,
     #[error("invalid APP_ENV '{0}', expected development, staging, or production")]
     Environment(String),
     #[error("production requires PUBLIC_REGISTRY_URL to use https")]
@@ -100,8 +96,8 @@ pub enum ConfigError {
     ProductionStorage,
     #[error("production requires STATIC_ROOT to contain the built frontend")]
     ProductionStaticRoot,
-    #[error("production requires bootstrap admin credentials on first startup")]
-    BootstrapAdminRequired,
+    #[error("production requires Knotree Accounts sign-in (SSO_ENABLED=true)")]
+    ProductionSso,
 }
 
 impl AppConfig {
@@ -149,12 +145,6 @@ impl AppConfig {
         let token_service =
             env::var("TOKEN_SERVICE").unwrap_or_else(|_| "knotree-registry".to_owned());
         let token_ttl_seconds = parse_u64("REGISTRY_TOKEN_TTL_SECONDS", 300)?;
-        let bootstrap_admin_username = env::var("BOOTSTRAP_ADMIN_USERNAME")
-            .ok()
-            .filter(|value| !value.trim().is_empty());
-        let bootstrap_admin_password = env::var("BOOTSTRAP_ADMIN_PASSWORD")
-            .ok()
-            .filter(|value| !value.trim().is_empty());
         let cookie_secure = parse_bool("COOKIE_SECURE", true)?;
         let r2_endpoint = env::var("R2_ENDPOINT")
             .ok()
@@ -215,8 +205,6 @@ impl AppConfig {
             token_issuer,
             token_service,
             token_ttl_seconds,
-            bootstrap_admin_username,
-            bootstrap_admin_password,
             cookie_secure,
             r2_endpoint,
             r2_bucket,
@@ -296,9 +284,6 @@ impl AppConfig {
                 self.token_ttl_seconds.to_string(),
             ));
         }
-        if self.bootstrap_admin_username.is_some() != self.bootstrap_admin_password.is_some() {
-            return Err(ConfigError::BootstrapCredentialsIncomplete);
-        }
         if self.database_max_connections == 0 {
             return Err(ConfigError::Number(
                 "DATABASE_MAX_CONNECTIONS",
@@ -320,6 +305,9 @@ impl AppConfig {
         if self.environment == AppEnvironment::Production {
             if public_url.scheme() != "https" {
                 return Err(ConfigError::ProductionPublicUrl);
+            }
+            if self.sso.is_none() {
+                return Err(ConfigError::ProductionSso);
             }
             if !self.require_database || self.database_url.is_none() {
                 return Err(ConfigError::ProductionDatabase);
@@ -392,8 +380,6 @@ mod tests {
             token_issuer: "knotree-registry".to_owned(),
             token_service: "knotree-registry".to_owned(),
             token_ttl_seconds: 300,
-            bootstrap_admin_username: None,
-            bootstrap_admin_password: None,
             cookie_secure: true,
             r2_endpoint: None,
             r2_bucket: None,
@@ -427,6 +413,13 @@ mod tests {
         config.database_url = Some("postgres://registry:secret@db/registry".to_owned());
         config.require_database = true;
         config.static_root = Some(PathBuf::from("."));
+        assert!(matches!(config.validate(), Err(ConfigError::ProductionSso)));
+        config.sso = Some(crate::SsoConfig {
+            issuer: "https://accounts.knotree.com".into(),
+            service_origin: "https://accounts.knotree.com".into(),
+            client_id: "knotree-registry".into(),
+            redirect_uri: "https://registry.example.com/api/v1/auth/sso/callback".into(),
+        });
         assert!(matches!(
             config.validate(),
             Err(ConfigError::ProductionStorage)

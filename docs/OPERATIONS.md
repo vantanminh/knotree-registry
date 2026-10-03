@@ -4,7 +4,7 @@
 
 The checked-in production compose profile runs PostgreSQL and a single `registry-server` container. The image builds and serves `web/dist` itself, so the Cloudflare Tunnel should target `http://127.0.0.1:8080`; no Vite development server belongs in the production path. Put TLS and request-size limits at the edge as well as in the application. Use `STORAGE_BACKEND=r2` with a private bucket when the host must be replaceable; local storage is supported only when the registry volume is backed up and the deployment stays single-host. The optional edge Worker uses a separate blob host and only receives short-lived digest-bound grants.
 
-The service fails fast in `APP_ENV=production` unless the public URL is HTTPS, PostgreSQL is required, cookies are secure, memory storage is disabled, and `STATIC_ROOT/index.html` exists. The first boot needs `BOOTSTRAP_ADMIN_USERNAME` and `BOOTSTRAP_ADMIN_PASSWORD`; later restarts restore the existing user and ignore the bootstrap pair.
+The service fails fast in `APP_ENV=production` unless the public URL is HTTPS, PostgreSQL is required, cookies are secure, memory storage is disabled, and `STATIC_ROOT/index.html` exists. It also requires Knotree Accounts sign-in (`SSO_ENABLED=true`); there is no local password sign-in or bootstrap administrator. Set `SSO_ADMIN_SUBJECTS` to the Knotree account ids that administer the instance.
 
 ## Backups and restore
 

@@ -158,13 +158,18 @@ pub(crate) struct StartQuery {
     intent: Option<String>,
 }
 
+/// Only same-site paths, so a sign-in can never redirect off Registry.
 fn safe_return_to(value: Option<&str>) -> String {
     value
-        .and_then(|path| {
-            path.strip_prefix("/cloud/authorize/")
-                .and_then(|id| Uuid::parse_str(id).ok())
-                .map(|id| format!("/cloud/authorize/{id}"))
+        .filter(|path| {
+            path.starts_with('/')
+                && !path.starts_with("//")
+                && !path.contains('\\')
+                && path.len() <= 512
+                && !path.chars().any(char::is_control)
+                && !path.starts_with("/api/")
         })
+        .map(str::to_owned)
         .unwrap_or_else(|| "/".into())
 }
 
@@ -363,18 +368,20 @@ async fn bounded_json<T: serde::de::DeserializeOwned>(
 mod tests {
     use super::*;
     #[test]
-    fn consent_return_path_is_a_local_uuid_route() {
-        let id = Uuid::new_v4();
-        let path = format!("/cloud/authorize/{id}");
-        assert_eq!(safe_return_to(Some(&path)), path);
+    fn return_path_stays_on_registry() {
+        assert_eq!(
+            safe_return_to(Some("/repositories/kt-a/app")),
+            "/repositories/kt-a/app"
+        );
+        assert_eq!(safe_return_to(None), "/");
         for value in [
             "//attacker.example",
             "/\\attacker.example",
-            "/cloud/authorize/not-a-uuid",
-            "/cloud/authorize/../login",
             "https://attacker.example",
+            "/api/v1/auth/logout",
+            "/a\nb",
         ] {
-            assert_eq!(safe_return_to(Some(value)), "/");
+            assert_eq!(safe_return_to(Some(value)), "/", "{value}");
         }
     }
     #[test]

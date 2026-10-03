@@ -30,7 +30,6 @@ struct RuntimeSnapshot {
 
 #[derive(Clone)]
 pub struct AppState {
-    pub(crate) cloud_grants: Arc<tokio::sync::Mutex<crate::cloud_grants::CloudGrants>>,
     pub(crate) sso_attempts: Arc<tokio::sync::Mutex<crate::sso::LoginAttempts>>,
     pub config: Arc<AppConfig>,
     pub store: DynObjectStore,
@@ -120,18 +119,6 @@ impl AppState {
                 config.token_ttl_seconds,
             ),
         });
-        if !auth.has_users().await {
-            if let (Some(username), Some(password)) = (
-                config.bootstrap_admin_username.as_deref(),
-                config.bootstrap_admin_password.as_deref(),
-            ) {
-                auth.bootstrap_admin(username, password)
-                    .await
-                    .map_err(AppError::Auth)?;
-            } else if config.environment == crate::AppEnvironment::Production {
-                return Err(crate::ConfigError::BootstrapAdminRequired.into());
-            }
-        }
         let catalog = Arc::new(match persisted.as_ref() {
             Some(snapshot) => {
                 Catalog::from_snapshot(snapshot.catalog.clone()).map_err(AppError::Catalog)?
@@ -165,9 +152,6 @@ impl AppState {
                 .map_err(|_| crate::ConfigError::CloudWebhook)?;
         }
         let state = Self {
-            cloud_grants: Arc::new(tokio::sync::Mutex::new(
-                crate::cloud_grants::CloudGrants::default(),
-            )),
             sso_attempts: Arc::new(tokio::sync::Mutex::new(crate::sso::LoginAttempts::default())),
             config: Arc::new(config),
             store,

@@ -38,7 +38,7 @@ docker compose --env-file deploy/.env -f deploy/docker-compose.yml ps
 Invoke-RestMethod http://127.0.0.1:8080/readyz
 ```
 
-The first startup creates the configured bootstrap administrator. Keep that password in the secret manager; after the first login, create a narrowly scoped PAT in the dashboard for Docker/CI and do not use the browser password with `docker login`. The compose profile binds the registry only to localhost, uses PostgreSQL for durable state, serves the frontend from the image, and runs as a non-root read-only container with a writable data volume.
+Sign-in uses Knotree Accounts only (`SSO_ENABLED=true`); administrators are the Knotree account ids in `SSO_ADMIN_SUBJECTS`. After signing in, create a narrowly scoped access token in the dashboard for `docker login` and CI. The compose profile binds the registry only to localhost, uses PostgreSQL for durable state, serves the frontend from the image, and runs as a non-root read-only container with a writable data volume.
 
 The current runtime snapshot model is deliberately single-instance: do not run multiple registry containers against the same database until the normalized PostgreSQL repositories are enabled. Use R2 and the documented backup procedure before treating the machine as disposable.
 
@@ -51,41 +51,27 @@ See [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md), [docs/decisions/DEC-001.md](do
 Authentication details and the Docker token exchange are documented in [docs/product/AUTHENTICATION.md](docs/product/AUTHENTICATION.md). The OCI data-plane contract and upload semantics are documented in [docs/product/OCI.md](docs/product/OCI.md).
 The dashboard/API split and local frontend workflow are documented in [docs/product/CONTROL_PLANE.md](docs/product/CONTROL_PLANE.md).
 
-## Central identity and repository namespaces
+## Knotree accounts and repository namespaces
 
-The authentication service supports federated subjects for the upcoming
-Accounts sign-in integration. Each issuer/subject pair maps to a stable
-`kt-...` username and private repository prefix `<username>/...`, persisted
-with existing authentication state. New federated users are never instance
-administrators and have no Registry password. Token issuance and bearer
-checks enforce this namespace, including denial of instance/admin scopes.
-The control plane filters repository inventory and audit events for these
-users and keeps global webhook/upload/GC operations restricted to admins.
-The existing bootstrap admin and its repositories remain under operator
-control. Accounts login is available through `/api/v1/auth/sso/start` and its
-server-side callback when `SSO_ENABLED=true`. The login screen checks
-`/api/v1/auth/sso/config` before offering central sign-in. Set `SSO_ISSUER`,
-`SSO_CLIENT_ID=knotree-registry` and `SSO_REDIRECT_URI` only after Accounts
-and the exact callback are ready. The API uses browser-bound single-use state,
-S256 PKCE and verified live userinfo from the pinned issuer, then persists a
-local session. Tokens and authorization codes are not written to logs.
-Pending login requests are memory-only and expire after ten minutes; restart
-sign-in after a Registry process restart. Central SSO is disabled by default.
+Registry has no passwords of its own. The web UI signs in through Knotree
+Accounts (`/api/v1/auth/sso/start`; `?intent=signup` opens account creation)
+with browser-bound single-use state, S256 PKCE and live userinfo from the
+pinned issuer. Production refuses to start without SSO. Each Knotree account
+maps to a stable `kt-...` username and private repository prefix
+`<username>/...`; token issuance and bearer checks enforce this namespace.
+Administrators are the account ids listed in `SSO_ADMIN_SUBJECTS`, applied at
+every sign-in. Passwords, emails and two-step verification are managed in the
+Knotree account. `docker login` uses access tokens created after signing in.
 
-Cloud authorization and live end-to-end verification are still pending;
-these code changes do not prove production SSO is active.
+### Knotree Cloud
 
-### Knotree Cloud auto deploy
+Cloud uses the same Knotree account, so users never connect the two services.
+Cloud calls the cluster-only internal API (`INTERNAL_BIND_ADDR`, Kubernetes
+TokenReview, see [docs/OPERATIONS.md](docs/OPERATIONS.md)) for the signed-in
+account: it lists that account's repositories and tags, resolves digests, and
+obtains per-repository pull-only credentials that it renews itself.
 
-**Deployments → Knotree Cloud** shows whether the managed `tag_updated` webhook to Cloud is configured, how many deliveries are queued, and the last 25 attempts with their HTTP status (the last 100 attempts across all webhooks are kept in the persisted runtime state and served at `GET /api/v1/webhooks/deliveries`). `GET /api/v1/integrations/cloud` returns the same status for admins and never includes the signing secret. To deploy on push, create a pull-only Access Token for the repository and connect it on the service page in Knotree Cloud; the managed webhook endpoint is marked as such on the Webhooks page and cannot be disabled from the dashboard.
-
-### Cloud pull authorization
-
-With Accounts SSO enabled, Cloud can request explicit, repository-scoped pull consent. `POST /api/v1/cloud-grants/requests` accepts `client_id=knotree-cloud`, the exact callback `https://cloud.knotree.com/api/v1/auth/knotree-registry/callback`, a random `state` (32–128 URL-safe characters), `repository`, `code_challenge`, `code_challenge_method=S256`, and `expected_issuer`/`expected_subject` from the Cloud Accounts identity. The result contains `request_id`, `authorization_url` and `expires_in=600`. Only that federated identity with access to that repository may review and decide the request at `/cloud/authorize/{request_id}`. SSO preserves only this local UUID route as its return path.
-
-The browser posts `{ "allow": true }` or `{ "allow": false }` to `/api/v1/cloud-grants/requests/{id}/decision` with its Registry session and same-origin Origin header. It receives a callback URL with state and a single-use code, or `error=access_denied`. Cloud exchanges the code using `POST /api/v1/cloud-grants/exchange` with `client_id`, `redirect_uri`, `code`, `code_verifier`. The server verifies S256 PKCE and the live approving session before minting a pull-only credential lasting 30 days. The no-store JSON response contains username, credential, credential_id, exact repository, Accounts issuer/subject, expiry and `actions=["pull"]`. Cloud must validate these fields and encrypt the credential; never place it in browser storage or callback URLs. Users revoke credentials in Access Tokens.
-
-Pending requests and codes are bounded to 4096 entries, kept in memory and expire after ten/two minutes; restart invalidates pending consent. No credential exists until code exchange. The callback/client pair is fixed; custom Cloud domains require a reviewed server-side allowlist change. This local implementation still requires GitHub backend CI and live consent/pull/revocation testing before production enablement.
+**Deployments → Knotree Cloud** shows whether the managed `tag_updated` webhook to Cloud is configured, how many deliveries are queued, and the last 25 attempts with their HTTP status (the last 100 attempts across all webhooks are kept in the persisted runtime state and served at `GET /api/v1/webhooks/deliveries`). `GET /api/v1/integrations/cloud` returns the same status for admins and never includes the signing secret. The managed webhook endpoint is marked as such on the Webhooks page and cannot be disabled from the dashboard.
 
 ### Production settings through GitHub Actions
 

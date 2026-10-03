@@ -1,6 +1,4 @@
 export type User = { id: string; username: string; is_admin: boolean };
-export type TotpStatus = { enabled: boolean };
-export type TotpSetup = { secret: string; otpauth_uri: string };
 export type Scope = { repository: string; actions: string[] };
 export type Token = {
   id: string;
