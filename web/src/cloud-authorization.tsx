@@ -4,7 +4,8 @@ import { api, friendlyError } from "./api";
 
 type Consent = {
   client: string;
-  repository: string;
+  repository: string | null;
+  namespace: string | null;
   username: string;
   credential_lifetime_days: number;
 };
@@ -51,10 +52,15 @@ export function CloudAuthorizationPage() {
         <h1>Connect to Cloud</h1>
         {!consent && !error && <p role="status">Loading authorization request…</p>}
         {consent && <>
-          <p>{consent.client} requests permission to pull images from:</p>
-          <strong style={{ overflowWrap: "anywhere" }}>{consent.repository}</strong>
+          {consent.namespace ? <>
+            <p>{consent.client} requests permission to list and pull every image in your namespace:</p>
+            <strong style={{ overflowWrap: "anywhere" }}>{consent.namespace}/*</strong>
+          </> : <>
+            <p>{consent.client} requests permission to pull images from:</p>
+            <strong style={{ overflowWrap: "anywhere" }}>{consent.repository}</strong>
+          </>}
           <p>Signed in as {consent.username}. Access lasts {consent.credential_lifetime_days} days. You can revoke it in Registry Access Tokens.</p>
-          <p>Cloud can download images from this repository. This permission does not allow pushing or deleting images.</p>
+          <p>Cloud can download {consent.namespace ? "your images, including repositories you create later" : "images from this repository"}. This permission does not allow pushing or deleting images.</p>
           <button className="btn primary full" disabled={busy} onClick={() => decide(true)}>{busy ? "Processing…" : "Allow pull access"}</button>
           <button className="btn full" disabled={busy} onClick={() => decide(false)}>Deny</button>
         </>}
