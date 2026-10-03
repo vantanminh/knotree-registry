@@ -6,6 +6,6 @@ mod service;
 mod totp;
 
 pub use service::{
-    AuthError, AuthService, CredentialCreated, CredentialSummary, MintedToken, Session, TotpSetup,
-    TotpStatus, UserSummary, parse_scope,
+    AuthError, AuthService, CredentialCreated, CredentialSummary, MintedToken, RevokedCredential,
+    Session, TotpSetup, TotpStatus, UserSummary, parse_scope,
 };

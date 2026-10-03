@@ -107,6 +107,15 @@ pub struct CredentialSummary {
     pub revoked_at: Option<u64>,
 }
 
+/// What a revoked credential was, so callers can notify integrations that
+/// relied on it.
+#[derive(Debug, Clone)]
+pub struct RevokedCredential {
+    pub name: String,
+    pub namespace_pull: Option<String>,
+    pub owner_username: String,
+}
+
 #[derive(Debug, Clone, Serialize)]
 pub struct MintedToken {
     pub token: String,
@@ -806,7 +815,7 @@ impl AuthService {
         &self,
         session_token: &str,
         id: Uuid,
-    ) -> Result<(), AuthError> {
+    ) -> Result<RevokedCredential, AuthError> {
         let user_id = self.session_user_id(session_token).await?;
         let mut state = self.state.write().await;
         let is_admin = state
@@ -822,7 +831,22 @@ impl AuthService {
             return Err(AuthError::NoAccess);
         }
         credential.revoked_at = Some(now_seconds());
-        Ok(())
+        let (name, namespace_pull, owner_id) = (
+            credential.name.clone(),
+            credential.namespace_pull.clone(),
+            credential.user_id,
+        );
+        let owner_username = state
+            .users
+            .values()
+            .find(|user| user.id == owner_id)
+            .map(|user| user.username.clone())
+            .unwrap_or_default();
+        Ok(RevokedCredential {
+            name,
+            namespace_pull,
+            owner_username,
+        })
     }
 
     pub async fn mint_token(

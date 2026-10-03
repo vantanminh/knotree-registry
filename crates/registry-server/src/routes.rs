@@ -1800,15 +1800,50 @@ async fn revoke_token(
 ) -> Result<impl IntoResponse, crate::AppError> {
     let session = cookie_value(&headers).ok_or(registry_auth::AuthError::InvalidSession)?;
     let actor = state.auth.session_user(session).await?;
-    state
+    let revoked = state
         .auth
         .revoke_credential_for_session(session, id)
         .await?;
     let mut event = RegistryEvent::new(EventKind::TokenRevoked);
-    event.actor = Some(actor.username);
+    event.actor = Some(actor.username.clone());
     event.metadata = json!({"credential_id": id});
     state.record_event(event).await;
+    if let Some(event) = grant_revoked_event(&state, id, &revoked, actor.username).await {
+        state.record_event(event).await;
+    }
     Ok(StatusCode::NO_CONTENT)
+}
+
+/// Tells Cloud that a credential it was granted is gone, so it stops
+/// auto-deploying instead of failing on the next pull.
+async fn grant_revoked_event(
+    state: &AppState,
+    credential_id: Uuid,
+    revoked: &registry_auth::RevokedCredential,
+    actor: String,
+) -> Option<RegistryEvent> {
+    let is_cloud_grant = revoked.namespace_pull.is_some()
+        || revoked.name == crate::cloud_grants::REPOSITORY_GRANT_NAME
+        || revoked.name == crate::cloud_grants::NAMESPACE_GRANT_NAME;
+    if !is_cloud_grant {
+        return None;
+    }
+    let mut event = RegistryEvent::new(EventKind::GrantRevoked);
+    event.actor = Some(actor);
+    let mut metadata = json!({
+        "credential_id": credential_id,
+        "namespace": revoked.owner_username,
+    });
+    if let Some((issuer, subject)) = state
+        .auth
+        .federated_identity_for_username(&revoked.owner_username)
+        .await
+    {
+        metadata["owner_issuer"] = json!(issuer);
+        metadata["owner_subject"] = json!(subject);
+    }
+    event.metadata = metadata;
+    Some(event)
 }
 
 #[derive(Debug, Deserialize)]

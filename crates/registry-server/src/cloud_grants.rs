@@ -23,6 +23,8 @@ use crate::{AppError, AppState};
 const CLIENT: &str = "knotree-cloud";
 const CALLBACK: &str = "https://cloud.knotree.com/api/v1/auth/knotree-registry/callback";
 const CAPACITY: usize = 4096;
+pub(crate) const REPOSITORY_GRANT_NAME: &str = "Knotree Cloud pull authorization";
+pub(crate) const NAMESPACE_GRANT_NAME: &str = "Knotree Cloud account connection";
 
 /// What Cloud asks for: one repository, or pull access to the user's whole
 /// namespace (account-level connection).
@@ -311,7 +313,7 @@ pub(crate) async fn exchange(
                 .auth
                 .create_credential_for_session(
                     &approved.session_token,
-                    "Knotree Cloud pull authorization".into(),
+                    REPOSITORY_GRANT_NAME.into(),
                     vec![RepositoryScope {
                         repository: repository.clone(),
                         actions: [Action::Pull].into_iter().collect(),
@@ -327,7 +329,7 @@ pub(crate) async fn exchange(
                 .auth
                 .create_namespace_pull_credential_for_session(
                     &approved.session_token,
-                    "Knotree Cloud account connection".into(),
+                    NAMESPACE_GRANT_NAME.into(),
                     expires_at,
                 )
                 .await?,
@@ -700,13 +702,52 @@ mod flow_tests {
             .unwrap();
         assert_ne!(
             get_basic(
-                app,
+                app.clone(),
                 "/api/v1/integrations/cloud/repositories",
                 ns,
                 &pat.secret
             )
             .await,
             StatusCode::OK
+        );
+
+        // Revoking the grant notifies Cloud; revoking an ordinary PAT does not.
+        for id in [
+            pat.id.to_string(),
+            grant["credential_id"].as_str().unwrap().to_owned(),
+        ] {
+            let response = app
+                .clone()
+                .oneshot(
+                    Request::builder()
+                        .method("POST")
+                        .uri(format!("/api/v1/auth/tokens/{id}/revoke"))
+                        .header(header::COOKIE, &cookie)
+                        .body(Body::empty())
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(response.status(), StatusCode::NO_CONTENT);
+        }
+        let revoked: Vec<_> = state
+            .events
+            .recent(100)
+            .await
+            .into_iter()
+            .filter(|event| event.kind == EventKind::GrantRevoked)
+            .collect();
+        assert_eq!(revoked.len(), 1);
+        assert_eq!(revoked[0].metadata["credential_id"], grant["credential_id"]);
+        assert_eq!(revoked[0].metadata["namespace"], json!(ns));
+        assert_eq!(revoked[0].metadata["owner_subject"], json!("alice"));
+        assert_eq!(
+            revoked[0].metadata["owner_issuer"],
+            json!("https://accounts.knotree.com")
+        );
+        assert_eq!(
+            get_basic(app, "/api/v1/integrations/cloud/repositories", ns, secret).await,
+            StatusCode::UNAUTHORIZED
         );
     }
 }
