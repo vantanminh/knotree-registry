@@ -22,6 +22,8 @@ pub enum EventKind {
     ManifestDeleted,
     TokenCreated,
     TokenRevoked,
+    /// A Cloud integration grant was revoked by its owner.
+    GrantRevoked,
     PasswordChanged,
     TwoFactorEnabled,
     TwoFactorDisabled,
@@ -181,7 +183,9 @@ impl WebhookRegistry {
                 summary: WebhookSummary {
                     id,
                     url,
-                    events: [EventKind::TagUpdated].into_iter().collect(),
+                    events: [EventKind::TagUpdated, EventKind::GrantRevoked]
+                        .into_iter()
+                        .collect(),
                     enabled: true,
                     created_at,
                 },
@@ -650,7 +654,9 @@ mod tests {
         );
         assert_eq!(
             initial[0].events,
-            [EventKind::TagUpdated].into_iter().collect::<BTreeSet<_>>()
+            [EventKind::TagUpdated, EventKind::GrantRevoked]
+                .into_iter()
+                .collect::<BTreeSet<_>>()
         );
         assert!(
             registry
