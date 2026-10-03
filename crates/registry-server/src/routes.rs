@@ -1549,7 +1549,7 @@ async fn repository_detail(
     Ok(Json(repository_tags_json(&state, &repository).await?))
 }
 
-async fn repository_tags_json(
+pub(crate) async fn repository_tags_json(
     state: &AppState,
     repository: &RepositoryName,
 ) -> Result<serde_json::Value, crate::AppError> {
@@ -2142,6 +2142,8 @@ pub(crate) mod tests {
             edge_download_url: None,
             edge_download_secret: None,
             control_plane_origins: Vec::new(),
+            sso_admin_subjects: Vec::new(),
+            internal: None,
         }
     }
 

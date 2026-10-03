@@ -179,6 +179,7 @@ spec:
         app.kubernetes.io/name: registry
         app.kubernetes.io/part-of: knotree-registry
     spec:
+      serviceAccountName: registry
       imagePullSecrets:
         - name: registry-credentials
       securityContext:
@@ -195,6 +196,8 @@ spec:
           ports:
             - name: http
               containerPort: 8080
+            - name: internal
+              containerPort: 8081
           env:
             - name: APP_ENV
               value: production

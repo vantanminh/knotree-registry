@@ -52,6 +52,10 @@ pub struct AppConfig {
     pub edge_download_url: Option<String>,
     pub edge_download_secret: Option<String>,
     pub control_plane_origins: Vec<String>,
+    /// Knotree account subjects (`sub`) that are Registry administrators.
+    pub sso_admin_subjects: Vec<String>,
+    /// Cluster-only API for trusted Knotree services.
+    pub internal: Option<crate::internal::InternalConfig>,
 }
 
 #[derive(Debug, Error)]
@@ -60,6 +64,8 @@ pub enum ConfigError {
         "Cloud webhook requires HTTPS CLOUD_WEBHOOK_URL and KNOTREE_REGISTRY_WEBHOOK_SECRET of at least 32 characters"
     )]
     CloudWebhook,
+    #[error("invalid internal API configuration: {0}")]
+    Internal(&'static str),
     #[error("invalid Accounts SSO configuration: {0}")]
     Sso(&'static str),
     #[error("invalid BIND_ADDR: {0}")]
@@ -221,6 +227,16 @@ impl AppConfig {
             edge_download_url,
             edge_download_secret,
             control_plane_origins,
+            sso_admin_subjects: env::var("SSO_ADMIN_SUBJECTS")
+                .unwrap_or_default()
+                .split(',')
+                .map(str::trim)
+                .filter(|value| !value.is_empty())
+                .map(str::to_owned)
+                .collect(),
+            internal: crate::internal::InternalConfig::from_env(
+                environment == AppEnvironment::Production,
+            )?,
         };
         config.validate()?;
         Ok(config)
@@ -243,6 +259,14 @@ impl AppConfig {
         }
         if let Some(sso) = &self.sso {
             sso.validate(self.environment == AppEnvironment::Production)?;
+        }
+        if let Some(internal) = &self.internal {
+            internal.validate(self.environment == AppEnvironment::Production)?;
+            if self.sso.is_none() {
+                return Err(ConfigError::Internal(
+                    "the internal API requires Accounts SSO",
+                ));
+            }
         }
         let Ok(public_url) = url::Url::parse(&self.public_url) else {
             return Err(ConfigError::PublicUrl);
@@ -380,6 +404,8 @@ mod tests {
             edge_download_url: None,
             edge_download_secret: None,
             control_plane_origins: Vec::new(),
+            sso_admin_subjects: Vec::new(),
+            internal: None,
         }
     }
 
