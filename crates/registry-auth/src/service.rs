@@ -748,6 +748,16 @@ impl AuthService {
         })
     }
 
+    /// The central (issuer, subject) of the user owning `namespace`, if that
+    /// user signed in through Knotree accounts SSO.
+    pub async fn federated_identity_for_username(
+        &self,
+        namespace: &str,
+    ) -> Option<(String, String)> {
+        let state = self.state.read().await;
+        state.users.get(namespace)?.federated_identity.clone()
+    }
+
     /// Authenticates a namespace credential and returns its owner. Used by
     /// integration APIs that list the namespace's repositories.
     pub async fn verify_namespace_credential(
@@ -1316,6 +1326,10 @@ mod tests {
                 .expect("verify")
                 .id,
             alice.user.id
+        );
+        assert_eq!(
+            auth.federated_identity_for_username(&ns).await,
+            Some(("https://accounts.knotree.com".into(), "alice".into()))
         );
         assert!(
             auth.verify_namespace_credential(&bob.user.username, &credential.secret)

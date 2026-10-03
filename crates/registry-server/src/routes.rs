@@ -473,6 +473,17 @@ async fn put_manifest_response(
         tag_event.tag = Some(reference.to_owned());
         tag_event.digest = Some(manifest.digest.to_string());
         tag_event.metadata = image_event_metadata(state, repository, &manifest, true, reference);
+        // Cloud routes auto-deploys by owner, so it never trusts the name alone.
+        let namespace = repository.as_str().split('/').next().unwrap_or_default();
+        if let Some(fields) = tag_event.metadata.as_object_mut() {
+            fields.insert("namespace".into(), json!(namespace));
+            if let Some((issuer, subject)) =
+                state.auth.federated_identity_for_username(namespace).await
+            {
+                fields.insert("owner_issuer".into(), json!(issuer));
+                fields.insert("owner_subject".into(), json!(subject));
+            }
+        }
         state.record_event(tag_event).await;
     }
     let mut response = StatusCode::CREATED.into_response();
@@ -2733,6 +2744,10 @@ pub(crate) mod tests {
             payload["metadata"]["immutable_image"],
             format!("localhost:8080/team/app@{digest}")
         );
+        assert_eq!(payload["metadata"]["namespace"], "team");
+        // Local (non-SSO) owners carry no central identity, so Cloud cannot
+        // route their pushes to an account connection.
+        assert!(payload["metadata"].get("owner_subject").is_none());
         assert_eq!(
             headers["x-knotree-event"].to_str().expect("event header"),
             "tag_updated"

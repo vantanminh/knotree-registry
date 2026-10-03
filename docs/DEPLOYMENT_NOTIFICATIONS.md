@@ -45,10 +45,19 @@ Every request is a JSON `RegistryEvent` with `schema_version: 1`:
     "media_type": "application/vnd.oci.image.manifest.v1+json",
     "size": 421,
     "published_reference": "stable",
-    "is_tag": true
+    "is_tag": true,
+    "namespace": "team",
+    "owner_issuer": "https://accounts.knotree.com",
+    "owner_subject": "accounts-user-uuid"
   }
 }
 ```
+
+`tag_updated` events carry the repository `namespace`. When the namespace
+owner signed in through Knotree accounts SSO, they also carry `owner_issuer`
+and `owner_subject` (the accounts `sub`). Knotree Cloud routes auto-deploys
+for account connections only when these match the connected Cloud user, so a
+repository name alone is never trusted as proof of ownership.
 
 The following headers are sent with the exact raw body used for signing:
 
