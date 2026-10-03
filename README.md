@@ -77,7 +77,7 @@ these code changes do not prove production SSO is active.
 
 ### Knotree Cloud auto deploy
 
-**Deployments → Knotree Cloud** shows whether the managed `tag_updated` webhook to Cloud is configured, how many deliveries are queued, and the last 25 attempts with their HTTP status (the last 100 attempts across all webhooks are kept in the persisted runtime state and served at `GET /api/v1/webhooks/deliveries`). `GET /api/v1/integrations/cloud` returns the same status for admins and never includes the signing secret. To deploy on push, create a pull-only Access Token for the repository and connect it on the service page in Knotree Cloud; the managed webhook endpoint is marked as such on the Webhooks page and cannot be disabled from the dashboard.
+**Deployments → Knotree Cloud** shows whether the managed `tag_updated` webhook to Cloud is configured, how many deliveries are queued, and the last 25 attempts with their HTTP status (the last 100 attempts across all webhooks are kept in the persisted runtime state and served at `GET /api/v1/webhooks/deliveries`). `GET /api/v1/integrations/cloud` returns the same status for admins and never includes the signing secret. To deploy on push, add a Knotree Registry App service in Knotree Cloud, choose **Connect Knotree Registry** (approve the Registry consent request, or paste an Access Token scoped to `repository:<name>:pull` only), then enable auto deploy under the service's **Settings → Auto updates**; the managed webhook endpoint is marked as such on the Webhooks page and cannot be disabled from the dashboard.
 
 ### Cloud pull authorization
 

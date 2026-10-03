@@ -83,40 +83,45 @@ export function CloudConnectionPage({ admin, host }: { admin: boolean; host: str
         <div className="panel-head">
           <div>
             <h2>Connect a service</h2>
-            <p>Each Cloud service follows one repository with its own pull-only token.</p>
+            <p>Each Cloud App service follows one repository and tag, with pull-only access.</p>
           </div>
         </div>
         <ol className="cloud-steps">
           <li>
             <span className="cloud-step-num">1</span>
             <div>
-              <strong>Create a pull token</strong>
+              <strong>Create the service in Cloud</strong>
               <p>
-                In <Link to="/security/tokens">Access Tokens</Link>, create a token scoped to the repository with only <code>pull</code>. Copy the secret.
+                In your Knotree Cloud project, add an App service, pick the <em>Knotree Registry</em> source and enter the
+                tagged image, for example <code>{host}/team/app:latest</code>.
               </p>
             </div>
           </li>
           <li>
             <span className="cloud-step-num">2</span>
             <div>
-              <strong>Connect it in Cloud</strong>
+              <strong>Grant pull access</strong>
               <p>
-                Open the service in Knotree Cloud, choose <em>Connect repository</em>, enter <code>team/app</code>, the tag to follow and the token.
+                Choose <em>Connect Knotree Registry</em>. Either approve the request Cloud opens on this Registry, or paste a
+                token from <Link to="/security/tokens">Access Tokens</Link> scoped to <code>repository:team/app:pull</code> only.
               </p>
             </div>
           </li>
           <li>
             <span className="cloud-step-num">3</span>
             <div>
-              <strong>Push</strong>
-              <p>The next push of that tag deploys automatically. Pause or disconnect it from the same panel.</p>
+              <strong>Turn on auto deploy and push</strong>
+              <p>
+                Enable auto deploy in the service&apos;s <em>Settings → Auto updates</em>. Each push to that tag then deploys
+                its exact digest, and the panel lists recent pushes. A disconnected service can be reconnected there too.
+              </p>
               <CommandBox command={`docker push ${host}/team/app:latest`} />
             </div>
           </li>
         </ol>
         <div className="panel-pad" style={{ paddingTop: 0 }}>
-          <a className="btn primary" href="https://cloud.knotree.com/integrations" target="_blank" rel="noreferrer">
-            <KeyRound size={14} /> Open Cloud integrations
+          <a className="btn primary" href="https://cloud.knotree.com" target="_blank" rel="noreferrer">
+            <KeyRound size={14} /> Open Knotree Cloud
           </a>
         </div>
       </section>
