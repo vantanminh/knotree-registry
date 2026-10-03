@@ -1,6 +1,6 @@
 use std::{
     collections::{BTreeSet, HashMap},
-    time::Duration,
+    time::{Duration, SystemTime, UNIX_EPOCH},
 };
 
 use argon2::{
@@ -179,6 +179,9 @@ struct CredentialRecord {
     expires_at: Option<u64>,
     revoked_at: Option<u64>,
     last_used_at: Option<u64>,
+    /// Issue time in nanoseconds, used to order rotated credentials.
+    #[serde(default)]
+    issued_at_nanos: u64,
 }
 
 #[derive(Clone, Serialize, Deserialize)]
@@ -405,9 +408,10 @@ impl AuthService {
                     && credential.scopes.len() == 1
                     && credential.scopes[0].repository == repository
             })
-            .map(|credential| (credential.id, credential.expires_at.unwrap_or(u64::MAX)))
+            .map(|credential| (credential.id, credential.issued_at_nanos))
             .collect();
-        previous.sort_by_key(|(_, expires)| std::cmp::Reverse(*expires));
+        // Newest first; keep the most recent previous credential live.
+        previous.sort_by_key(|(_, issued)| std::cmp::Reverse(*issued));
         let now = now_seconds();
         for (id, _) in previous.into_iter().skip(1) {
             if let Some(credential) = state.credentials.get_mut(&id) {
@@ -719,6 +723,7 @@ impl AuthService {
             expires_at,
             revoked_at: None,
             last_used_at: None,
+            issued_at_nanos: now_nanos(),
         };
         let id = credential.id;
         let mut state = self.state.write().await;
@@ -781,6 +786,7 @@ impl AuthService {
                 expires_at,
                 revoked_at: None,
                 last_used_at: None,
+                issued_at_nanos: now_nanos(),
             },
         );
         Ok(CredentialCreated {
@@ -1121,6 +1127,14 @@ fn scopes_to_access(scopes: &[RepositoryScope]) -> Vec<AccessEntry> {
             actions: scope.actions.iter().map(ToString::to_string).collect(),
         })
         .collect()
+}
+
+fn now_nanos() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map_or(0, |elapsed| {
+            u64::try_from(elapsed.as_nanos()).unwrap_or(u64::MAX)
+        })
 }
 
 fn provision_federated(
