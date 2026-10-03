@@ -369,7 +369,10 @@ mod tests {
     use super::*;
     #[test]
     fn return_path_stays_on_registry() {
-        assert_eq!(safe_return_to(Some("/repositories/kt-a/app")), "/repositories/kt-a/app");
+        assert_eq!(
+            safe_return_to(Some("/repositories/kt-a/app")),
+            "/repositories/kt-a/app"
+        );
         assert_eq!(safe_return_to(None), "/");
         for value in [
             "//attacker.example",
