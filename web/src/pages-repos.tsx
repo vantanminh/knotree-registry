@@ -1,17 +1,14 @@
-import { useEffect, useMemo, useState } from "react";
+import { useMemo, useState } from "react";
 import { Link, useNavigate, useParams, useSearchParams } from "react-router-dom";
-import { Repository, RepositoryDetail, Tag, api, friendlyError } from "./api";
+import { ArrowRight, Box, Boxes, ChevronRight, Clock, FileJson, HardDrive, Lock, Plus, Tags as TagsIcon } from "lucide-react";
+import { AuditEvent, Repository, RepositoryDetail, Tag, useResource } from "./api";
+import { ActivityFeed } from "./events";
+import { formatBytes, isMultiPlatform, namespaceOf, registryPath, splitBytes, splitRepository, validateRepositoryName } from "./format";
+import { EventDrawer } from "./pages-overview";
+import { useSession } from "./session";
 import {
-  formatBytes,
-  isMultiPlatform,
-  namespaceOf,
-  registryPath,
-  splitRepository,
-  validateRepositoryName
-} from "./format";
-import {
+  Callout,
   CommandBox,
-  ConfirmDialog,
   CopyButton,
   DigestView,
   Drawer,
@@ -19,144 +16,187 @@ import {
   ErrorState,
   Modal,
   PageHeader,
+  Panel,
   RelativeTime,
   RepositoryName,
   SearchInput,
+  Segmented,
   Skeleton,
+  Stats,
   StatusBadge,
-  Tabs,
-  useToast
+  TagPill,
+  Tabs
 } from "./ui";
 
-export function RepositoriesPage({ host }: { host: string }) {
-  const [repos, setRepos] = useState<Repository[] | null>(null);
-  const [error, setError] = useState("");
+type Sort = "updated" | "name" | "size";
+
+export function RepositoriesPage() {
+  const { host } = useSession();
+  const { data, error, reload } = useResource<{ repositories: Repository[] }>("/api/v1/repositories");
   const [create, setCreate] = useState(false);
   const [params, setParams] = useSearchParams();
   const navigate = useNavigate();
   const search = params.get("q") ?? "";
   const namespace = params.get("namespace") ?? "";
-  const sort = params.get("sort") ?? "updated";
-  function load() {
-    api<{ repositories: Repository[] }>("/api/v1/repositories")
-      .then((result) => setRepos(result.repositories))
-      .catch((reason) => setError(friendlyError(reason)));
+  const sort = (params.get("sort") as Sort) ?? "updated";
+  const repos = data?.repositories;
+
+  function setParam(key: string, value: string) {
+    const next = new URLSearchParams(params);
+    if (value) next.set(key, value);
+    else next.delete(key);
+    setParams(next, { replace: true });
   }
-  useEffect(load, []);
-  const namespaces = useMemo(
-    () => Array.from(new Set((repos ?? []).map((repo) => namespaceOf(repo.name)))).sort(),
-    [repos]
-  );
+
+  const namespaces = useMemo(() => {
+    const map = new Map<string, number>();
+    for (const repo of repos ?? []) map.set(namespaceOf(repo.name), (map.get(namespaceOf(repo.name)) ?? 0) + 1);
+    return [...map.entries()].sort((a, b) => a[0].localeCompare(b[0]));
+  }, [repos]);
+  const maxSize = Math.max(1, ...(repos ?? []).map((repo) => repo.size ?? 0));
   const filtered = useMemo(() => {
-    const items = (repos ?? []).filter((repo) => {
-      const matchesQuery = !search || repo.name.includes(search.toLowerCase()) || (repo.latest_digest ?? "").includes(search);
-      const matchesNs = !namespace || namespaceOf(repo.name) === namespace;
-      return matchesQuery && matchesNs;
-    });
+    const q = search.toLowerCase();
+    const items = (repos ?? []).filter(
+      (repo) =>
+        (!q || repo.name.includes(q) || (repo.latest_digest ?? "").includes(q) || (repo.latest_tag ?? "").includes(q)) &&
+        (!namespace || namespaceOf(repo.name) === namespace)
+    );
     return [...items].sort((left, right) => {
       if (sort === "name") return left.name.localeCompare(right.name);
       if (sort === "size") return (right.size ?? 0) - (left.size ?? 0);
       return (right.updated_at ?? 0) - (left.updated_at ?? 0);
     });
   }, [repos, search, namespace, sort]);
-  if (error) return <ErrorState message={error} onRetry={load} />;
+
+  if (error) return <ErrorState message={error} onRetry={reload} />;
   if (!repos) return <Skeleton rows={8} />;
+
   return (
     <>
       <PageHeader
         title="Repositories"
-        description="Manage OCI images stored in this registry."
+        description="Every image repository in this registry. Repositories are created by their first push."
         actions={
           <button className="btn primary" onClick={() => setCreate(true)}>
-            New Repository
+            <Plus size={14} /> New repository
           </button>
         }
       />
-      <div className="filters">
-        <SearchInput
-          value={search}
-          onChange={(value) => {
-            params.set("q", value);
-            if (!value) params.delete("q");
-            setParams(params, { replace: true });
-          }}
-          placeholder="Search repositories"
-        />
-        <select
-          value={namespace}
-          onChange={(event) => {
-            params.set("namespace", event.target.value);
-            if (!event.target.value) params.delete("namespace");
-            setParams(params, { replace: true });
-          }}
-          aria-label="Namespace"
-        >
-          <option value="">All namespaces</option>
-          {namespaces.map((value) => (
-            <option key={value}>{value}</option>
-          ))}
-        </select>
-        <select
-          value={sort}
-          onChange={(event) => {
-            params.set("sort", event.target.value);
-            setParams(params, { replace: true });
-          }}
-          aria-label="Sort"
-        >
-          <option value="updated">Updated</option>
-          <option value="name">Name</option>
-          <option value="size">Size</option>
-        </select>
-      </div>
+      {repos.length > 0 && (
+        <div className="toolbar">
+          <SearchInput value={search} onChange={(value) => setParam("q", value)} placeholder="Filter by name, tag or digest" />
+          {namespaces.length > 1 && namespaces.length <= 6 ? (
+            <div className="filter-chips">
+              <button className={!namespace ? "filter-chip active" : "filter-chip"} onClick={() => setParam("namespace", "")}>
+                All
+              </button>
+              {namespaces.map(([ns, count]) => (
+                <button key={ns} className={namespace === ns ? "filter-chip active" : "filter-chip"} onClick={() => setParam("namespace", namespace === ns ? "" : ns)}>
+                  {ns} <span className="count">{count}</span>
+                </button>
+              ))}
+            </div>
+          ) : (
+            namespaces.length > 1 && (
+              <select className="select-sm" value={namespace} onChange={(event) => setParam("namespace", event.target.value)} aria-label="Namespace">
+                <option value="">All namespaces</option>
+                {namespaces.map(([ns, count]) => (
+                  <option key={ns} value={ns}>
+                    {ns} ({count})
+                  </option>
+                ))}
+              </select>
+            )
+          )}
+          <span className="spacer" />
+          <Segmented
+            label="Sort"
+            value={sort}
+            onChange={(value) => setParam("sort", value === "updated" ? "" : value)}
+            options={[
+              { id: "updated", label: "Recent" },
+              { id: "name", label: "Name" },
+              { id: "size", label: "Size" }
+            ]}
+          />
+        </div>
+      )}
       <section className="panel">
         {filtered.length ? (
-          <div className="table-wrap">
-            <table className="data">
-              <thead>
-                <tr>
-                  <th>Repository</th>
-                  <th>Namespace</th>
-                  <th>Latest tag</th>
-                  <th className="num">Image size</th>
-                  <th className="num hide-sm">Tags</th>
-                  <th>Updated</th>
-                  <th>Visibility</th>
-                </tr>
-              </thead>
-              <tbody>
-                {filtered.map((repo) => (
-                  <tr key={repo.name} onClick={() => navigate(`/repositories/${repo.name}`)}>
-                    <td>
-                      <RepositoryName name={repo.name} />
-                    </td>
-                    <td>{namespaceOf(repo.name)}</td>
-                    <td className="mono">{repo.latest_tag ?? "—"}</td>
-                    <td className="num">{formatBytes(repo.size ?? 0)}</td>
-                    <td className="num hide-sm">{repo.tag_count ?? 0}</td>
-                    <td>
-                      <RelativeTime value={repo.updated_at} />
-                    </td>
-                    <td>
-                      <StatusBadge state="neutral" label="Private" />
-                    </td>
+          <>
+            <div className="table-wrap">
+              <table className="data">
+                <thead>
+                  <tr>
+                    <th>Repository</th>
+                    <th>Latest tag</th>
+                    <th className="num hide-sm">Tags</th>
+                    <th className="num">Size</th>
+                    <th className="num hide-sm">Updated</th>
+                    <th className="shrink" aria-label="Actions" />
                   </tr>
-                ))}
-              </tbody>
-            </table>
-          </div>
-        ) : (
+                </thead>
+                <tbody>
+                  {filtered.map((repo) => (
+                    <tr key={repo.name} className="clickable" onClick={() => navigate(`/repositories/${repo.name}`)}>
+                      <td>
+                        <RepositoryName name={repo.name} />
+                      </td>
+                      <td>
+                        <TagPill tag={repo.latest_tag} />
+                      </td>
+                      <td className="num hide-sm">{repo.tag_count ?? 0}</td>
+                      <td className="num">
+                        <span className="inline-meter">
+                          <span className="tnum">{formatBytes(repo.size ?? 0)}</span>
+                          <span className="track hide-sm">
+                            <span style={{ width: `${((repo.size ?? 0) / maxSize) * 100}%` }} />
+                          </span>
+                        </span>
+                      </td>
+                      <td className="num hide-sm muted">
+                        <RelativeTime value={repo.updated_at} />
+                      </td>
+                      <td>
+                        <div className="row-actions">
+                          <CopyButton
+                            value={`docker pull ${registryPath(host, repo.name, repo.latest_tag ?? "latest")}`}
+                            title="Copy pull command"
+                          />
+                        </div>
+                      </td>
+                    </tr>
+                  ))}
+                </tbody>
+              </table>
+            </div>
+            <div className="panel-foot">
+              <span>
+                {filtered.length} of {repos.length} repositories
+              </span>
+              <span>All repositories are private</span>
+            </div>
+          </>
+        ) : repos.length ? (
           <EmptyState
-            title="No repositories yet"
-            text="Push your first image to start using Knotree Registry."
+            icon={<Box size={18} />}
+            title="No matching repositories"
+            text="Nothing matches the current filter."
             action={
-              <div className="grid-gap" style={{ width: "min(100%, 560px)", textAlign: "left" }}>
-                <CommandBox command={`docker login ${host}`} />
-                <CommandBox command={`docker tag my-app ${host}/production/my-app:latest`} />
-                <CommandBox command={`docker push ${host}/production/my-app:latest`} />
-              </div>
+              <button className="btn" onClick={() => setParams({}, { replace: true })}>
+                Clear filters
+              </button>
             }
           />
+        ) : (
+          <div className="panel-body">
+            <EmptyState icon={<Box size={18} />} title="No repositories yet" text="Push your first image and the repository appears here." />
+            <div className="stack-sm" style={{ maxWidth: 560, margin: "0 auto 16px" }}>
+              <CommandBox command={`docker login ${host}`} />
+              <CommandBox command={`docker tag my-app ${host}/production/my-app:latest`} />
+              <CommandBox command={`docker push ${host}/production/my-app:latest`} />
+            </div>
+          </div>
         )}
       </section>
       {create && <CreateRepositoryModal host={host} onClose={() => setCreate(false)} />}
@@ -169,200 +209,160 @@ function CreateRepositoryModal({ host, onClose }: { host: string; onClose: () =>
   const [name, setName] = useState("");
   const preview = [namespace, name].filter(Boolean).join("/");
   const error = name ? validateRepositoryName(preview) : null;
+  const ready = name && !error;
   return (
     <Modal
       title="New repository"
+      description="Repositories are created by the first push. Choose a path, then run the commands."
       onClose={onClose}
       footer={
-        <button className="btn ghost" onClick={onClose}>
+        <button className="btn primary" onClick={onClose}>
           Done
         </button>
       }
     >
-      <p>Repositories are created when the first manifest is pushed. Preview the path, then copy the commands.</p>
-      <label className="field">
-        <span>Namespace</span>
-        <input value={namespace} onChange={(event) => setNamespace(event.target.value.toLowerCase())} />
-      </label>
-      <label className="field">
-        <span>Repository name</span>
-        <input value={name} onChange={(event) => setName(event.target.value.toLowerCase())} placeholder="api" />
-        {error && <small>{error}</small>}
-      </label>
-      <label className="field">
-        <span>Visibility</span>
-        <select defaultValue="private">
-          <option value="private">Private</option>
-          <option value="public" disabled>
-            Public (not available)
-          </option>
-        </select>
-      </label>
-      <div className="secret-box">{registryPath(host, preview || "namespace/name")}</div>
-      {!error && name && (
-        <div className="grid-gap">
-          <CommandBox command={`docker tag my-app ${registryPath(host, preview)}:latest`} />
-          <CommandBox command={`docker push ${registryPath(host, preview)}:latest`} />
-        </div>
-      )}
+      <div className="choices">
+        <label className="field">
+          <span>Namespace</span>
+          <input value={namespace} onChange={(event) => setNamespace(event.target.value.toLowerCase())} spellCheck={false} />
+        </label>
+        <label className="field">
+          <span>Name</span>
+          <input value={name} onChange={(event) => setName(event.target.value.toLowerCase())} placeholder="api" autoFocus spellCheck={false} />
+        </label>
+      </div>
+      {error && <div className="error-text" style={{ color: "var(--danger)", fontSize: 12.5, marginTop: -8 }}>{error}</div>}
+      <div className="secret">
+        <Lock size={14} className="muted" />
+        <code>{registryPath(host, preview || "namespace/name")}</code>
+        <StatusBadge state="neutral" label="Private" />
+      </div>
+      <div className="stack-sm" style={{ opacity: ready ? 1 : 0.45, transition: "opacity 150ms" }}>
+        <CommandBox label="1 · Tag a local image" command={`docker tag my-app ${registryPath(host, ready ? preview : "namespace/name")}:latest`} />
+        <CommandBox label="2 · Push it" command={`docker push ${registryPath(host, ready ? preview : "namespace/name")}:latest`} />
+      </div>
     </Modal>
   );
 }
 
-export function RepositoryDetailPage({ host }: { host: string }) {
+export function RepositoryDetailPage() {
+  const { host } = useSession();
   const params = useParams();
   const [search, setSearch] = useSearchParams();
   const name = params["*"] ?? "";
   const tab = search.get("tab") ?? "tags";
-  const [data, setData] = useState<RepositoryDetail | null>(null);
-  const [error, setError] = useState("");
+  const { data, error, reload } = useResource<RepositoryDetail>(`/api/v1/repositories/${encodeURI(name)}`);
   const [selected, setSelected] = useState<Tag | null>(null);
   const [inspect, setInspect] = useState<Tag | null>(null);
-  const toast = useToast();
-  function load() {
-    api<RepositoryDetail>(`/api/v1/repositories/${encodeURI(name)}`)
-      .then(setData)
-      .catch((reason) => setError(friendlyError(reason)));
-  }
-  useEffect(load, [name]);
-  if (error) return <ErrorState message={error} onRetry={load} />;
-  if (!data) return <Skeleton rows={8} />;
-  const latest = data.tags.find((tag) => tag.tag === "latest") ?? data.tags[0];
+  const [filter, setFilter] = useState("");
+
+  if (error) return <ErrorState message={error} onRetry={reload} />;
+  if (!data) return <Skeleton rows={8} stats />;
+  const parts = splitRepository(data.name);
+  const tags = [...data.tags].sort((a, b) => b.created_at - a.created_at);
+  const latest = data.tags.find((tag) => tag.tag === "latest") ?? tags[0];
   const total = data.tags.reduce((sum, tag) => sum + tag.size, 0);
-  const newest = data.tags.reduce((max, tag) => Math.max(max, tag.created_at), 0);
+  const newest = tags[0]?.created_at ?? null;
+  const digests = new Set(data.tags.map((tag) => tag.digest)).size;
+  const shown = tags.filter((tag) => !filter || tag.tag.includes(filter.toLowerCase()) || tag.digest.includes(filter));
+  const setTab = (id: string) => {
+    const next = new URLSearchParams(search);
+    if (id === "tags") next.delete("tab");
+    else next.set("tab", id);
+    setSearch(next, { replace: true });
+  };
+
   return (
     <>
       <PageHeader
-        title={`${splitRepository(data.name).namespace} / ${splitRepository(data.name).repository}`}
-        description={registryPath(host, data.name)}
+        eyebrow={
+          <Link to={`/repositories?namespace=${encodeURIComponent(parts.namespace)}`} className="inline-link">
+            {parts.namespace}
+          </Link>
+        }
+        title={parts.repository}
+        badge={<StatusBadge state="neutral" label={<><Lock size={11} /> Private</>} />}
         actions={
           <>
-            <StatusBadge state="neutral" label="Private" />
-            <CopyButton value={registryPath(host, data.name)} label="Copy path" />
-            <button
-              className="btn primary"
-              onClick={async () => {
-                await navigator.clipboard.writeText(`docker pull ${registryPath(host, data.name, latest?.tag ?? "latest")}`);
-                toast("Copied to clipboard");
-              }}
-            >
-              Pull
-            </button>
+            <CopyButton className="btn" value={registryPath(host, data.name)} label="Copy image path" />
+
           </>
         }
       />
-      <div className="meta-row">
-        <div>
-          <span>Tags</span>
-          <strong>{data.tags.length}</strong>
-        </div>
-        <div>
-          <span>Stored manifests</span>
-          <strong>{formatBytes(total)}</strong>
-        </div>
-        <div>
-          <span>Last push</span>
-          <strong>
-            <RelativeTime value={newest || null} />
-          </strong>
-        </div>
-        <div>
-          <span>Latest digest</span>
-          <strong>
-            <DigestView value={latest?.digest} />
-          </strong>
-        </div>
+      <div style={{ marginBottom: 16 }}>
+        <CommandBox command={`docker pull ${registryPath(host, data.name, latest?.tag ?? "latest")}`} />
       </div>
+      <Stats
+        items={[
+          { label: "Tags", icon: <TagsIcon />, value: data.tags.length, detail: `${digests} unique digest${digests === 1 ? "" : "s"}` },
+          { label: "Manifest size", icon: <HardDrive />, ...splitBytes(total), detail: "Sum across tags" },
+          { label: "Last push", icon: <Clock />, value: <RelativeTime value={newest} />, detail: tags[0] ? <>tag <span className="mono">{tags[0].tag}</span></> : "No pushes yet" },
+          { label: "Latest digest", icon: <FileJson />, value: <span style={{ fontSize: 15 }}><DigestView value={latest?.digest} /></span>, detail: latest ? <>from <span className="mono">{latest.tag}</span></> : "—" }
+        ]}
+      />
       <Tabs
         value={tab}
         options={[
-          { id: "tags", label: "Tags" },
-          { id: "manifests", label: "Manifests" },
+          { id: "tags", label: "Tags", count: data.tags.length },
+          { id: "manifests", label: "Manifests", count: digests },
           { id: "activity", label: "Activity" },
           { id: "settings", label: "Settings" }
         ]}
-        onChange={(id) => {
-          search.set("tab", id);
-          setSearch(search, { replace: true });
-        }}
+        onChange={setTab}
       />
       {tab === "tags" && (
-        <section className="panel">
-          {data.tags.length ? (
-            <div className="table-wrap">
-              <table className="data">
-                <thead>
-                  <tr>
-                    <th>Tag</th>
-                    <th>Digest</th>
-                    <th>Platform</th>
-                    <th className="num">Size</th>
-                    <th>Pushed</th>
-                    <th></th>
-                  </tr>
-                </thead>
-                <tbody>
-                  {data.tags.map((tag) => (
-                    <tr key={tag.tag} onClick={() => setSelected(tag)}>
-                      <td>
-                        <span className="mono">{tag.tag}</span> {tag.tag === "latest" && <StatusBadge state="info" label="latest" />}
-                      </td>
-                      <td>
-                        <DigestView value={tag.digest} />
-                      </td>
-                      <td>{isMultiPlatform(tag.media_type) ? "Multi-platform" : "Single-platform"}</td>
-                      <td className="num">{formatBytes(tag.size)}</td>
-                      <td>
-                        <RelativeTime value={tag.created_at} />
-                      </td>
-                      <td>
-                        <span className="row-actions">
-                          <CopyButton value={`docker pull ${registryPath(host, data.name, tag.tag)}`} label="Pull" />
-                        </span>
-                      </td>
-                    </tr>
-                  ))}
-                </tbody>
-              </table>
+        <>
+          {data.tags.length > 6 && (
+            <div className="toolbar">
+              <SearchInput value={filter} onChange={setFilter} placeholder="Filter tags" />
             </div>
-          ) : (
-            <EmptyState title="No tags yet" text="Push a tagged manifest to populate this repository." />
           )}
-        </section>
+          <section className="panel">
+            {shown.length ? (
+              <div className="table-wrap">
+                <table className="data">
+                  <thead>
+                    <tr>
+                      <th>Tag</th>
+                      <th>Digest</th>
+                      <th className="hide-sm">Type</th>
+                      <th className="num">Size</th>
+                      <th className="num hide-sm">Pushed</th>
+                      <th className="shrink" aria-label="Actions" />
+                    </tr>
+                  </thead>
+                  <tbody>
+                    {shown.map((tag) => (
+                      <tr key={tag.tag} className="clickable" onClick={() => setSelected(tag)}>
+                        <td>
+                          <TagPill tag={tag.tag} />
+                        </td>
+                        <td>
+                          <DigestView value={tag.digest} />
+                        </td>
+                        <td className="hide-sm muted">{isMultiPlatform(tag.media_type) ? "Multi-platform index" : "Image manifest"}</td>
+                        <td className="num">{formatBytes(tag.size)}</td>
+                        <td className="num hide-sm muted">
+                          <RelativeTime value={tag.created_at} />
+                        </td>
+                        <td>
+                          <div className="row-actions">
+                            <CopyButton value={`docker pull ${registryPath(host, data.name, tag.tag)}`} label="Pull" />
+                          </div>
+                        </td>
+                      </tr>
+                    ))}
+                  </tbody>
+                </table>
+              </div>
+            ) : (
+              <EmptyState icon={<TagsIcon size={18} />} title={filter ? "No matching tags" : "No tags yet"} text={filter ? "Try another tag name or digest." : "Push a tagged image to populate this repository."} />
+            )}
+          </section>
+        </>
       )}
-      {tab === "manifests" && (
-        <section className="panel">
-          <div className="table-wrap">
-            <table className="data">
-              <thead>
-                <tr>
-                  <th>Digest</th>
-                  <th>Media type</th>
-                  <th className="num">Size</th>
-                  <th>Layers</th>
-                </tr>
-              </thead>
-              <tbody>
-                {data.tags.map((tag) => (
-                  <tr key={`${tag.tag}-${tag.digest}`} onClick={() => setInspect(tag)}>
-                    <td>
-                      <DigestView value={tag.digest} />
-                    </td>
-                    <td className="mono">{tag.media_type.split(".").slice(-2).join(".")}</td>
-                    <td className="num">{formatBytes(tag.size)}</td>
-                    <td>{tag.references?.length ?? 0}</td>
-                  </tr>
-                ))}
-              </tbody>
-            </table>
-          </div>
-        </section>
-      )}
-      {tab === "activity" && (
-        <section className="panel">
-          <EmptyState title="Repository activity" text="Filtered activity for this repository is available in the audit log." action={<Link className="btn" to={`/security/audit?repository=${encodeURIComponent(data.name)}`}>Open audit log</Link>} />
-        </section>
-      )}
+      {tab === "manifests" && <ManifestList tags={tags} onInspect={setInspect} />}
+      {tab === "activity" && <RepositoryActivity name={data.name} />}
       {tab === "settings" && <RepositorySettings name={data.name} host={host} />}
       {selected && (
         <TagDrawer
@@ -381,6 +381,66 @@ export function RepositoryDetailPage({ host }: { host: string }) {
   );
 }
 
+function ManifestList({ tags, onInspect }: { tags: Tag[]; onInspect: (tag: Tag) => void }) {
+  const byDigest = new Map<string, Tag[]>();
+  for (const tag of tags) byDigest.set(tag.digest, [...(byDigest.get(tag.digest) ?? []), tag]);
+  return (
+    <section className="panel">
+      <div className="table-wrap">
+        <table className="data">
+          <thead>
+            <tr>
+              <th>Digest</th>
+              <th>Tags</th>
+              <th className="hide-sm">Media type</th>
+              <th className="num">References</th>
+              <th className="num">Size</th>
+            </tr>
+          </thead>
+          <tbody>
+            {[...byDigest.entries()].map(([digest, group]) => (
+              <tr key={digest} className="clickable" onClick={() => onInspect(group[0])}>
+                <td>
+                  <DigestView value={digest} />
+                </td>
+                <td>
+                  <span className="row" style={{ gap: 4, flexWrap: "nowrap" }}>
+                    {group.slice(0, 3).map((tag) => (
+                      <TagPill key={tag.tag} tag={tag.tag} />
+                    ))}
+                    {group.length > 3 && <span className="muted">+{group.length - 3}</span>}
+                  </span>
+                </td>
+                <td className="mono muted hide-sm">{group[0].media_type.replace("application/vnd.", "")}</td>
+                <td className="num">{group[0].references?.length ?? 0}</td>
+                <td className="num">{formatBytes(group[0].size)}</td>
+              </tr>
+            ))}
+          </tbody>
+        </table>
+      </div>
+    </section>
+  );
+}
+
+function RepositoryActivity({ name }: { name: string }) {
+  const { data, error, reload } = useResource<{ events: AuditEvent[] }>("/api/v1/audit?limit=200");
+  const [selected, setSelected] = useState<AuditEvent | null>(null);
+  if (error) return <ErrorState message={error} onRetry={reload} />;
+  if (!data) return <Skeleton rows={4} />;
+  const events = data.events.filter((event) => event.repository === name);
+  return (
+    <section className="panel" style={{ paddingBottom: 8 }}>
+      {events.length ? (
+        <ActivityFeed events={events} onSelect={setSelected} />
+      ) : (
+        <EmptyState icon={<Clock size={18} />} title="No recent activity" text="Pushes and tag changes for this repository will appear here." />
+      )}
+      {selected && <EventDrawer event={selected} onClose={() => setSelected(null)} />}
+    </section>
+  );
+}
+
 function TagDrawer({
   host,
   repository,
@@ -394,47 +454,39 @@ function TagDrawer({
   onClose: () => void;
   onInspect: () => void;
 }) {
-  const [confirm, setConfirm] = useState(false);
   return (
-    <Drawer title={tag.tag} onClose={onClose}>
-      <label className="field">
-        <span>Digest</span>
-        <DigestView value={tag.digest} />
-      </label>
-      <label className="field">
-        <span>Media type</span>
-        <code>{tag.media_type}</code>
-      </label>
-      <label className="field">
-        <span>Compressed size</span>
-        <strong>{formatBytes(tag.size)}</strong>
-      </label>
-      <label className="field">
-        <span>Pushed</span>
-        <RelativeTime value={tag.created_at} />
-      </label>
-      <CommandBox command={`docker pull ${registryPath(host, repository, tag.tag)}`} />
-      <p style={{ color: "var(--muted)", fontSize: 13 }}>Digest references always resolve to this exact image version.</p>
-      <CommandBox command={`docker pull ${registryPath(host, repository, tag.digest)}`} />
-      <div className="header-actions">
-        <button className="btn" onClick={onInspect}>
-          View manifest
+    <Drawer
+      eyebrow={<span className="mono">{repository}</span>}
+      title={<span className="mono">:{tag.tag}</span>}
+      onClose={onClose}
+      actions={
+        <button className="btn sm" onClick={onInspect}>
+          <FileJson size={13} /> Manifest
         </button>
-        <button className="btn danger" onClick={() => setConfirm(true)}>
-          Delete tag
-        </button>
+      }
+    >
+      <dl className="kv">
+        <dt>Digest</dt>
+        <dd>
+          <DigestView value={tag.digest} />
+        </dd>
+        <dt>Type</dt>
+        <dd>{isMultiPlatform(tag.media_type) ? "Multi-platform index" : "Image manifest"}</dd>
+        <dt>Media type</dt>
+        <dd className="mono" style={{ fontSize: 12 }}>{tag.media_type}</dd>
+        <dt>Size</dt>
+        <dd>{formatBytes(tag.size)}</dd>
+        <dt>Pushed</dt>
+        <dd>
+          <RelativeTime value={tag.created_at} />
+        </dd>
+        <dt>References</dt>
+        <dd>{tag.references?.length ?? 0} descriptors</dd>
+      </dl>
+      <div className="stack-sm">
+        <CommandBox label="Pull by tag" command={`docker pull ${registryPath(host, repository, tag.tag)}`} />
+        <CommandBox label="Pull by digest — always this exact image" command={`docker pull ${registryPath(host, repository, tag.digest)}`} />
       </div>
-      {confirm && (
-        <ConfirmDialog
-          title="Delete tag?"
-          text="Deleting this manifest removes its repository reference. Unreferenced data may be removed later by garbage collection."
-          confirmLabel="Delete tag"
-          confirmValue={`${repository}:${tag.tag}`}
-          danger
-          onClose={() => setConfirm(false)}
-          onConfirm={() => setConfirm(false)}
-        />
-      )}
     </Drawer>
   );
 }
@@ -453,117 +505,158 @@ function ManifestInspector({ tag, onClose }: { tag: Tag; onClose: () => void }) 
     null,
     2
   );
+  const refs = tag.references ?? [];
   return (
-    <Modal title="Manifest inspector" onClose={onClose} wide footer={<CopyButton value={payload} label="Copy JSON" />}>
-      <h3>Overview</h3>
-      <p className="mono">{tag.digest}</p>
-      <h3>Layers</h3>
-      {(tag.references ?? []).length ? (
-        <div className="table-wrap">
-          <table className="data">
-            <thead>
-              <tr>
-                <th>Digest</th>
-                <th>Media type</th>
-                <th className="num">Size</th>
-              </tr>
-            </thead>
-            <tbody>
-              {(tag.references ?? []).map((ref) => (
-                <tr key={ref.digest}>
-                  <td>
-                    <DigestView value={ref.digest} />
-                  </td>
-                  <td className="mono">{ref.media_type}</td>
-                  <td className="num">{formatBytes(ref.size)}</td>
+    <Modal
+      title="Manifest"
+      description={<span className="mono">{tag.digest}</span>}
+      onClose={onClose}
+      wide
+      footer={
+        <>
+          <span className="left muted" style={{ fontSize: 12.5 }}>
+            {refs.length} references · {formatBytes(refs.reduce((sum, ref) => sum + ref.size, 0))}
+          </span>
+          <CopyButton className="btn" value={payload} label="Copy JSON" />
+        </>
+      }
+    >
+      {refs.length ? (
+        <div className="panel">
+          <div className="table-wrap">
+            <table className="data">
+              <thead>
+                <tr>
+                  <th>Digest</th>
+                  <th>Media type</th>
+                  <th className="num">Size</th>
                 </tr>
-              ))}
-            </tbody>
-          </table>
+              </thead>
+              <tbody>
+                {refs.map((ref) => (
+                  <tr key={ref.digest}>
+                    <td>
+                      <DigestView value={ref.digest} />
+                    </td>
+                    <td className="mono muted" style={{ fontSize: 12 }}>{ref.media_type.replace("application/vnd.", "")}</td>
+                    <td className="num">{formatBytes(ref.size)}</td>
+                  </tr>
+                ))}
+              </tbody>
+            </table>
+          </div>
         </div>
       ) : (
-        <p>No referenced descriptors are recorded for this tag.</p>
+        <p className="muted">No referenced descriptors are recorded for this manifest.</p>
       )}
-      <h3>Raw JSON</h3>
-      <pre className="secret-box">{payload}</pre>
+      <pre className="code-block">{payload}</pre>
     </Modal>
   );
 }
 
 function RepositorySettings({ name, host }: { name: string; host: string }) {
   return (
-    <div className="grid-gap">
-      <section className="panel panel-pad grid-gap">
-        <h2>General</h2>
-        <label className="field">
-          <span>Name</span>
-          <input value={name} readOnly />
-        </label>
-        <label className="field">
-          <span>Registry path</span>
-          <div className="secret-box">{registryPath(host, name)}</div>
-        </label>
-        <label className="field">
-          <span>Visibility</span>
-          <select defaultValue="private">
-            <option>Private</option>
-          </select>
-        </label>
-      </section>
+    <div className="stack-lg">
+      <Panel title="General">
+        <div className="panel-body">
+          <dl className="kv">
+            <dt>Name</dt>
+            <dd className="mono">{name}</dd>
+            <dt>Registry path</dt>
+            <dd>
+              <span className="row" style={{ gap: 4 }}>
+                <span className="mono">{registryPath(host, name)}</span>
+                <CopyButton value={registryPath(host, name)} />
+              </span>
+            </dd>
+            <dt>Visibility</dt>
+            <dd>
+              <StatusBadge state="neutral" label="Private" /> <span className="muted" style={{ fontSize: 12.5, marginLeft: 6 }}>Public repositories are not available on this instance.</span>
+            </dd>
+          </dl>
+        </div>
+      </Panel>
       <section className="danger-zone">
-        <h3>Danger zone</h3>
-        <p>Permanently delete repository metadata and schedule unreferenced content for garbage collection.</p>
-        <p style={{ marginTop: 8, color: "var(--muted)" }}>Repository deletion is not exposed on this control plane yet. Remove manifests through the OCI API, then run garbage collection.</p>
+        <div className="panel-head bordered">
+          <div>
+            <h2>Delete repository</h2>
+            <p>Not available from the dashboard yet.</p>
+          </div>
+        </div>
+        <div className="panel-body">
+          <Callout tone="info">
+            Delete manifests through the OCI API (<code>DELETE /v2/{name}/manifests/&lt;digest&gt;</code>), then run garbage collection to free the
+            storage they used.
+          </Callout>
+        </div>
       </section>
     </div>
   );
 }
 
 export function NamespacesPage() {
-  const [repos, setRepos] = useState<Repository[] | null>(null);
-  const [error, setError] = useState("");
-  const navigate = useNavigate();
-  useEffect(() => {
-    api<{ repositories: Repository[] }>("/api/v1/repositories")
-      .then((result) => setRepos(result.repositories))
-      .catch((reason) => setError(friendlyError(reason)));
-  }, []);
-  if (error) return <ErrorState message={error} />;
-  if (!repos) return <Skeleton />;
+  const { data, error, reload } = useResource<{ repositories: Repository[] }>("/api/v1/repositories");
+  if (error) return <ErrorState message={error} onRetry={reload} />;
+  if (!data) return <Skeleton />;
   const groups = new Map<string, Repository[]>();
-  for (const repo of repos) {
+  for (const repo of data.repositories) {
     const ns = namespaceOf(repo.name);
     groups.set(ns, [...(groups.get(ns) ?? []), repo]);
   }
+  const entries = [...groups.entries()].sort((a, b) => a[0].localeCompare(b[0]));
   return (
     <>
-      <PageHeader title="Namespaces" description="Namespaces group repositories, tokens, and access." />
-      <section className="panel">
-        {groups.size ? (
-          <div className="table-wrap">
-            <table className="data">
-              <thead>
-                <tr>
-                  <th>Namespace</th>
-                  <th className="num">Repositories</th>
-                  <th className="num">Storage</th>
-                </tr>
-              </thead>
-              <tbody>
-                {[...groups.entries()].map(([ns, items]) => (
-                  <tr key={ns} onClick={() => navigate(`/repositories?namespace=${ns}`)}>
-                    <td className="repo-primary">{ns}</td>
-                    <td className="num">{items.length}</td>
-                    <td className="num">{formatBytes(items.reduce((sum, item) => sum + (item.size ?? 0), 0))}</td>
-                  </tr>
-                ))}
-              </tbody>
-            </table>
-          </div>
-        ) : (
-          <EmptyState title="No namespaces yet" text="Namespaces appear after the first image is pushed." />
-        )}
-      </section>
+      <PageHeader title="Namespaces" description="The first path segment of a repository. Use them to group images by team, product or environment." />
+      {entries.length ? (
+        <div className="card-grid">
+          {entries.map(([ns, items]) => {
+            const size = items.reduce((sum, item) => sum + (item.size ?? 0), 0);
+            const updated = Math.max(...items.map((item) => item.updated_at ?? 0));
+            return (
+              <Link key={ns} className="ns-card" to={`/repositories?namespace=${encodeURIComponent(ns)}`}>
+                <div className="ns-card-head">
+                  <span className="repo-icon"><Boxes /></span>
+                  <strong>{ns}</strong>
+                  <ChevronRight size={16} className="chev" />
+                </div>
+                <div className="meta-strip">
+                  <div>
+                    <span>Repositories</span>
+                    <strong>{items.length}</strong>
+                  </div>
+                  <div>
+                    <span>Storage</span>
+                    <strong>{formatBytes(size)}</strong>
+                  </div>
+                  <div>
+                    <span>Updated</span>
+                    <strong><RelativeTime value={updated || null} /></strong>
+                  </div>
+                </div>
+                <div className="repos">
+                  {items.slice(0, 4).map((item) => (
+                    <span className="tag-pill" key={item.name}>{splitRepository(item.name).repository}</span>
+                  ))}
+                  {items.length > 4 && <span className="muted" style={{ fontSize: 12, alignSelf: "center" }}>+{items.length - 4} more</span>}
+                </div>
+              </Link>
+            );
+          })}
+        </div>
+      ) : (
+        <section className="panel">
+          <EmptyState
+            icon={<Boxes size={18} />}
+            title="No namespaces yet"
+            text="Namespaces appear after the first image is pushed."
+            action={
+              <Link className="btn" to="/repositories">
+                Go to repositories <ArrowRight size={14} />
+              </Link>
+            }
+          />
+        </section>
+      )}
     </>
   );
 }
