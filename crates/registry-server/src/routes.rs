@@ -85,6 +85,14 @@ pub fn router(state: AppState) -> Router {
         .route("/api/v1/webhooks/{id}/disable", post(disable_webhook))
         .route("/api/v1/webhooks/deliveries", get(webhook_deliveries))
         .route("/api/v1/integrations/cloud", get(cloud_integration))
+        .route(
+            "/api/v1/integrations/cloud/repositories",
+            get(integration_repositories),
+        )
+        .route(
+            "/api/v1/integrations/cloud/repositories/{*repository}",
+            get(integration_repository_tags),
+        )
         .route("/api/v1/admin/gc", post(run_gc));
     let router = if let Some(root) = state.config.static_root.clone() {
         router.fallback_service(
@@ -465,6 +473,17 @@ async fn put_manifest_response(
         tag_event.tag = Some(reference.to_owned());
         tag_event.digest = Some(manifest.digest.to_string());
         tag_event.metadata = image_event_metadata(state, repository, &manifest, true, reference);
+        // Cloud routes auto-deploys by owner, so it never trusts the name alone.
+        let namespace = repository.as_str().split('/').next().unwrap_or_default();
+        if let Some(fields) = tag_event.metadata.as_object_mut() {
+            fields.insert("namespace".into(), json!(namespace));
+            if let Some((issuer, subject)) =
+                state.auth.federated_identity_for_username(namespace).await
+            {
+                fields.insert("owner_issuer".into(), json!(issuer));
+                fields.insert("owner_subject".into(), json!(subject));
+            }
+        }
         state.record_event(tag_event).await;
     }
     let mut response = StatusCode::CREATED.into_response();
@@ -1527,6 +1546,14 @@ async fn repository_detail(
     if !user.can_access_repository(&repository) {
         return Err(registry_auth::AuthError::NoAccess.into());
     }
+    Ok(Json(repository_tags_json(&state, &repository).await?))
+}
+
+async fn repository_tags_json(
+    state: &AppState,
+    repository: &RepositoryName,
+) -> Result<serde_json::Value, crate::AppError> {
+    let repository = repository.clone();
     let (tags, _) = state.catalog.list_tags(&repository, None, 1000).await?;
     let mut entries = Vec::with_capacity(tags.len());
     for tag in tags {
@@ -1541,9 +1568,46 @@ async fn repository_detail(
             "subject": manifest.subject,
         }));
     }
+    Ok(json!({"name": repository, "visibility": "private", "tags": entries}))
+}
+
+/// Authenticates Knotree Cloud with a namespace-scoped grant credential
+/// (HTTP Basic `<username>:<secret>`). The result is always the grant owner,
+/// so the integration API can only ever see that owner's namespace.
+async fn namespace_grant_user(
+    state: &AppState,
+    headers: &HeaderMap,
+) -> Result<registry_auth::UserSummary, crate::AppError> {
+    let (username, secret) =
+        basic_credentials(headers).ok_or(registry_auth::AuthError::InvalidCredentials)?;
+    Ok(state
+        .auth
+        .verify_namespace_credential(&username, &secret)
+        .await?)
+}
+
+async fn integration_repositories(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+) -> Result<impl IntoResponse, crate::AppError> {
+    let user = namespace_grant_user(&state, &headers).await?;
     Ok(Json(
-        json!({"name": repository, "visibility": "private", "tags": entries}),
+        json!({"namespace": user.username, "repositories": user_inventory(&state, &user).await.repositories}),
     ))
+}
+
+async fn integration_repository_tags(
+    State(state): State<AppState>,
+    Path(repository): Path<String>,
+    headers: HeaderMap,
+) -> Result<impl IntoResponse, crate::AppError> {
+    let user = namespace_grant_user(&state, &headers).await?;
+    let repository = RepositoryName::parse(&repository)
+        .map_err(|_| crate::AppError::BadRequest("invalid repository name"))?;
+    if user.is_admin || !user.can_access_repository(&repository) {
+        return Err(registry_auth::AuthError::NoAccess.into());
+    }
+    Ok(Json(repository_tags_json(&state, &repository).await?))
 }
 
 #[derive(Debug, Deserialize)]
@@ -2680,6 +2744,10 @@ pub(crate) mod tests {
             payload["metadata"]["immutable_image"],
             format!("localhost:8080/team/app@{digest}")
         );
+        assert_eq!(payload["metadata"]["namespace"], "team");
+        // Local (non-SSO) owners carry no central identity, so Cloud cannot
+        // route their pushes to an account connection.
+        assert!(payload["metadata"].get("owner_subject").is_none());
         assert_eq!(
             headers["x-knotree-event"].to_str().expect("event header"),
             "tag_updated"

@@ -7,6 +7,7 @@ export type Token = {
   name: string;
   prefix: string;
   scopes: Scope[];
+  namespace_pull?: string | null;
   expires_at: number | null;
   last_used_at: number | null;
   revoked_at: number | null;

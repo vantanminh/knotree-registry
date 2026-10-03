@@ -101,6 +101,7 @@ pub struct CredentialSummary {
     pub name: String,
     pub prefix: String,
     pub scopes: Vec<RepositoryScope>,
+    pub namespace_pull: Option<String>,
     pub expires_at: Option<u64>,
     pub last_used_at: Option<u64>,
     pub revoked_at: Option<u64>,
@@ -163,6 +164,9 @@ struct CredentialRecord {
     prefix: String,
     verifier: SecretVerifier,
     scopes: Vec<RepositoryScope>,
+    /// Pull-only access to every repository under `<namespace>/`.
+    #[serde(default)]
+    namespace_pull: Option<String>,
     expires_at: Option<u64>,
     revoked_at: Option<u64>,
     last_used_at: Option<u64>,
@@ -640,6 +644,7 @@ impl AuthService {
                 name: credential.name.clone(),
                 prefix: credential.prefix.clone(),
                 scopes: credential.scopes.clone(),
+                namespace_pull: credential.namespace_pull.clone(),
                 expires_at: credential.expires_at,
                 last_used_at: credential.last_used_at,
                 revoked_at: credential.revoked_at,
@@ -665,6 +670,7 @@ impl AuthService {
             prefix: prefix.clone(),
             verifier,
             scopes: scopes.clone(),
+            namespace_pull: None,
             expires_at,
             revoked_at: None,
             last_used_at: None,
@@ -693,6 +699,97 @@ impl AuthService {
             scopes,
             expires_at,
         })
+    }
+
+    /// Issues a pull-only credential covering every repository in the
+    /// session user's own namespace, including repositories created later.
+    pub async fn create_namespace_pull_credential_for_session(
+        &self,
+        session_token: &str,
+        name: String,
+        expires_at: Option<u64>,
+    ) -> Result<CredentialCreated, AuthError> {
+        if name.trim().is_empty() {
+            return Err(AuthError::InvalidScope);
+        }
+        let user_id = self.session_user_id(session_token).await?;
+        let (secret, prefix, verifier) = issue_secret("kntr_pat_");
+        let mut state = self.state.write().await;
+        let username = state
+            .users
+            .values()
+            .find(|user| user.id == user_id)
+            .map(|user| user.username.clone())
+            .ok_or(AuthError::InvalidSession)?;
+        let id = Uuid::new_v4();
+        state.credential_prefixes.insert(prefix.clone(), id);
+        state.credentials.insert(
+            id,
+            CredentialRecord {
+                id,
+                user_id,
+                name: name.clone(),
+                prefix: prefix.clone(),
+                verifier,
+                scopes: Vec::new(),
+                namespace_pull: Some(username),
+                expires_at,
+                revoked_at: None,
+                last_used_at: None,
+            },
+        );
+        Ok(CredentialCreated {
+            id,
+            name,
+            prefix,
+            secret,
+            scopes: Vec::new(),
+            expires_at,
+        })
+    }
+
+    /// The central (issuer, subject) of the user owning `namespace`, if that
+    /// user signed in through Knotree accounts SSO.
+    pub async fn federated_identity_for_username(
+        &self,
+        namespace: &str,
+    ) -> Option<(String, String)> {
+        let state = self.state.read().await;
+        state.users.get(namespace)?.federated_identity.clone()
+    }
+
+    /// Authenticates a namespace credential and returns its owner. Used by
+    /// integration APIs that list the namespace's repositories.
+    pub async fn verify_namespace_credential(
+        &self,
+        username: &str,
+        secret: &str,
+    ) -> Result<UserSummary, AuthError> {
+        let prefix: String = secret.chars().take(16).collect();
+        let now = now_seconds();
+        let state = self.state.read().await;
+        let user = state
+            .users
+            .get(username)
+            .ok_or(AuthError::InvalidCredentials)?;
+        let credential = state
+            .credential_prefixes
+            .get(&prefix)
+            .and_then(|id| state.credentials.get(id))
+            .ok_or(AuthError::InvalidCredentials)?;
+        if credential.user_id != user.id || !credential.verifier.verify(secret) {
+            return Err(AuthError::InvalidCredentials);
+        }
+        if credential.revoked_at.is_some() {
+            return Err(AuthError::CredentialRevoked);
+        }
+        if credential.expires_at.is_some_and(|value| value <= now) {
+            return Err(AuthError::CredentialExpired);
+        }
+        if credential.namespace_pull.as_deref() != Some(user.username.as_str()) {
+            return Err(AuthError::NoAccess);
+        }
+        Ok(summary(user))
     }
 
     pub async fn revoke_credential(&self, id: Uuid) -> Result<(), AuthError> {
@@ -748,7 +845,7 @@ impl AuthService {
         };
         let prefix: String = secret.chars().take(16).collect();
         let now = now_seconds();
-        let (credential_id, scopes, credential_expiry) = {
+        let (credential_id, scopes, namespace_pull, credential_expiry) = {
             let mut state = self.state.write().await;
             let credential_id = *state
                 .credential_prefixes
@@ -774,13 +871,14 @@ impl AuthService {
             (
                 credential.id,
                 credential.scopes.clone(),
+                credential.namespace_pull.clone(),
                 credential.expires_at,
             )
         };
-        let access = if requested.is_empty() {
-            scopes_to_access(&scopes)
-        } else {
-            intersect_scopes(&scopes, requested)
+        let access = match namespace_pull.as_deref() {
+            Some(namespace) => intersect_namespace_pull(namespace, requested),
+            None if requested.is_empty() => scopes_to_access(&scopes),
+            None => intersect_scopes(&scopes, requested),
         };
         if access.is_empty() {
             return Err(AuthError::NoAccess);
@@ -934,6 +1032,22 @@ fn intersect_scopes(actual: &[RepositoryScope], requested: &[RepositoryScope]) -
                 name: wanted.repository.to_string(),
                 actions,
             })
+        })
+        .collect()
+}
+
+fn intersect_namespace_pull(namespace: &str, requested: &[RepositoryScope]) -> Vec<AccessEntry> {
+    let prefix = format!("{namespace}/");
+    requested
+        .iter()
+        .filter(|wanted| {
+            wanted.repository.as_str().starts_with(&prefix)
+                && wanted.actions.contains(&Action::Pull)
+        })
+        .map(|wanted| AccessEntry {
+            typ: "repository".to_owned(),
+            name: wanted.repository.to_string(),
+            actions: vec![Action::Pull.to_string()],
         })
         .collect()
 }
@@ -1156,6 +1270,82 @@ mod tests {
                 &[scope("repository:team/app:pull")]
             )
             .await,
+            Err(AuthError::CredentialRevoked)
+        ));
+    }
+
+    #[tokio::test]
+    async fn namespace_pull_credential_only_pulls_own_namespace() {
+        let auth = AuthService::new("knotree-registry", "knotree-registry", 300);
+        let alice = auth
+            .login_federated("https://accounts.knotree.com", "alice")
+            .await
+            .expect("alice");
+        let bob = auth
+            .login_federated("https://accounts.knotree.com", "bob")
+            .await
+            .expect("bob");
+        let ns = alice.user.username.clone();
+        let credential = auth
+            .create_namespace_pull_credential_for_session(&alice.token, "cloud".into(), None)
+            .await
+            .expect("credential");
+        let mint = |value: String| {
+            let auth = auth.clone();
+            let ns = ns.clone();
+            let secret = credential.secret.clone();
+            async move {
+                auth.mint_token(&ns, &secret, "knotree-registry", &[scope(&value)])
+                    .await
+            }
+        };
+        let minted = mint(format!("repository:{ns}/new-app:pull,push,delete"))
+            .await
+            .expect("pull in own namespace");
+        let repository = RepositoryName::parse(&format!("{ns}/new-app")).unwrap();
+        assert!(
+            auth.verify_bearer(&minted.token, &repository, Action::Pull)
+                .await
+                .is_ok()
+        );
+        assert!(matches!(
+            auth.verify_bearer(&minted.token, &repository, Action::Push)
+                .await,
+            Err(AuthError::NoAccess)
+        ));
+        let other = format!("{}/app", bob.user.username);
+        assert!(matches!(
+            mint(format!("repository:{other}:pull")).await,
+            Err(AuthError::NoAccess)
+        ));
+        assert!(matches!(
+            mint(format!("repository:{ns}-evil/app:pull")).await,
+            Err(AuthError::NoAccess)
+        ));
+        assert!(matches!(
+            mint(format!("repository:{ns}/app:push")).await,
+            Err(AuthError::NoAccess)
+        ));
+        assert_eq!(
+            auth.verify_namespace_credential(&ns, &credential.secret)
+                .await
+                .expect("verify")
+                .id,
+            alice.user.id
+        );
+        assert_eq!(
+            auth.federated_identity_for_username(&ns).await,
+            Some(("https://accounts.knotree.com".into(), "alice".into()))
+        );
+        assert!(
+            auth.verify_namespace_credential(&bob.user.username, &credential.secret)
+                .await
+                .is_err()
+        );
+        auth.revoke_credential(credential.id).await.unwrap();
+        assert!(matches!(
+            auth.verify_namespace_credential(&ns, &credential.secret)
+                .await,
             Err(AuthError::CredentialRevoked)
         ));
     }

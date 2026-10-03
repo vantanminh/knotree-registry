@@ -93,6 +93,9 @@ export function TokensPage({ host, username }: { host: string; username: string 
                     </td>
                     <td>Personal</td>
                     <td>
+                      {token.namespace_pull && (
+                        <span className="chip">{token.namespace_pull}/* · pull</span>
+                      )}
                       {token.scopes.map((scope) => (
                         <span className="chip" key={scope.repository}>
                           {scope.repository} · {scope.actions.join(" ")}
@@ -369,6 +372,12 @@ export function TokenDetailPage() {
         </div>
         <div>
           <h3>Repository access</h3>
+          {token.namespace_pull && (
+            <div style={{ marginTop: 12 }}>
+              <span className="chip">{token.namespace_pull}/*</span>
+              <span className="chip">pull</span>
+            </div>
+          )}
           {token.scopes.map((scope) => (
             <div key={scope.repository} style={{ marginTop: 12 }}>
               <span className="chip">{scope.repository}</span>
