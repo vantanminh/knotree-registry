@@ -31,6 +31,13 @@
     "POSTGRES_USER",
     "POSTGRES_DB"
   ],
+  "optional_config": [
+    "INTERNAL_BIND_ADDR",
+    "INTERNAL_AUTH",
+    "INTERNAL_TOKEN_AUDIENCE",
+    "INTERNAL_ALLOWED_SERVICE_ACCOUNTS",
+    "SSO_ADMIN_SUBJECTS"
+  ],
   "secrets": [
     "DATABASE_URL",
     "POSTGRES_PASSWORD",

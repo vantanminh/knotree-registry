@@ -45,6 +45,37 @@ Invoke-RestMethod -Method Post "$env:REGISTRY_URL/api/v1/admin/gc" -Headers @{ C
 
 Inspect failures before running the same request with `dry_run:false`. Never bypass repository authorization to make a digest visible; deduplicated bytes are still attached to repositories in metadata.
 
+## Knotree accounts and the internal API
+
+Web sign-in goes through Knotree Accounts (`SSO_ENABLED=true`). Registry
+administrators are the Knotree account ids listed in `SSO_ADMIN_SUBJECTS`
+(comma separated). The list is applied at every sign-in, so removing an id
+removes the role the next time that person signs in. `docker login` keeps
+using access tokens created in the web UI after signing in.
+
+Knotree Cloud reads a user's images and gets image-pull credentials through a
+cluster-only API, so users never connect the two services by hand:
+
+- `INTERNAL_BIND_ADDR=0.0.0.0:8081` starts the listener. It is exposed only
+  by the `registry-internal` Service (`deploy/k8s/internal.yaml`), never by
+  the public ingress, and the `registry` NetworkPolicy admits port 8081 from
+  the `knotree-cloud` namespace only.
+- Cloud presents a projected ServiceAccount token with audience
+  `knotree-registry-internal` (`INTERNAL_TOKEN_AUDIENCE`). Registry verifies it
+  with the Kubernetes TokenReview API (the `registry` ServiceAccount is bound to
+  `system:auth-delegator`). It accepts only the ServiceAccounts in
+  `INTERNAL_ALLOWED_SERVICE_ACCOUNTS`, by default
+  `system:serviceaccount:knotree-cloud:knotree-cloud-knotree-api`.
+- Each request names the Knotree account (`X-Knotree-Issuer`,
+  `X-Knotree-Subject`). Registry answers only for that account's own
+  namespace, even when the account is an administrator.
+- `POST /internal/v1/pull-credentials` issues a pull-only credential for one
+  repository, valid for 90 days. Cloud rotates it, and Registry keeps the
+  newest two live so pods that are still pulling are not cut off.
+
+For local development without Kubernetes, set `INTERNAL_AUTH=dev-token` and an
+`INTERNAL_DEV_TOKEN` of at least 32 characters. Production refuses this mode.
+
 ## Signing keys and token revocation
 
 The active ES256 signing key and `kid` are included in the PostgreSQL runtime snapshot, so a normal restart does not invalidate browser sessions or short-lived registry tokens. The current snapshot is single-instance and last-write-wins; do not scale the registry horizontally. A future multi-instance rollout must replace the snapshot with transactional repositories and a key-ring backed by `registry_signing_keys` before adding replicas. Revoking a PAT immediately prevents new token minting; existing bearer tokens expire at the configured TTL.

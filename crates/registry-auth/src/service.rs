@@ -1,6 +1,6 @@
 use std::{
     collections::{BTreeSet, HashMap},
-    time::Duration,
+    time::{Duration, SystemTime, UNIX_EPOCH},
 };
 
 use argon2::{
@@ -179,6 +179,9 @@ struct CredentialRecord {
     expires_at: Option<u64>,
     revoked_at: Option<u64>,
     last_used_at: Option<u64>,
+    /// Issue time in nanoseconds, used to order rotated credentials.
+    #[serde(default)]
+    issued_at_nanos: u64,
 }
 
 #[derive(Clone, Serialize, Deserialize)]
@@ -341,44 +344,81 @@ impl AuthService {
     /// Only call after verifying the central provider's live userinfo response.
     /// External identities receive an isolated repository namespace and no admin role.
     pub async fn login_federated(&self, issuer: &str, subject: &str) -> Result<Session, AuthError> {
-        if issuer.is_empty()
-            || issuer.len() > 2048
-            || subject.is_empty()
-            || subject.len() > 255
-            || issuer.chars().chain(subject.chars()).any(char::is_control)
-        {
-            return Err(AuthError::InvalidCredentials);
-        }
-        let identity = (issuer.to_owned(), subject.to_owned());
-        let identity_key = serde_json::to_string(&identity)
-            .map_err(|_| AuthError::PersistentStateSerialization)?;
-        // Digest-derived namespace is stable across restarts and distinct providers.
-        let digest: String = raw_digest(&identity_key)
-            .iter()
-            .map(|byte| format!("{byte:02x}"))
-            .collect();
-        let username = format!("kt-{digest}");
-        let username = username[..64].to_owned();
+        self.login_federated_as(issuer, subject, false).await
+    }
+
+    /// Signs in a central identity. `admin` comes from operator configuration
+    /// (allow-listed subjects) and is re-applied on every sign-in, so removing
+    /// a subject from the list removes the role at its next sign-in.
+    pub async fn login_federated_as(
+        &self,
+        issuer: &str,
+        subject: &str,
+        admin: bool,
+    ) -> Result<Session, AuthError> {
         let mut state = self.state.write().await;
-        let user = if let Some(user) = state.users.get(&username) {
-            if user.federated_identity.as_ref() != Some(&identity) || user.is_admin {
-                return Err(AuthError::InvalidCredentials);
-            }
-            user.clone()
-        } else {
-            let user = UserRecord {
-                id: Uuid::new_v4(),
-                username: username.clone(),
-                password_hash: "!sso-only".into(),
-                is_admin: false,
-                federated_identity: Some(identity),
-                totp_secret: None,
-                totp_pending_secret: None,
-            };
-            state.users.insert(username, user.clone());
-            user
-        };
+        let user = provision_federated(&mut state, issuer, subject, Some(admin))?;
         Ok(issue_session(&mut state, &user))
+    }
+
+    /// Returns the Registry user for a central identity, creating it on first
+    /// use. Used by trusted in-cluster services acting for that identity; the
+    /// admin role is never granted here.
+    pub async fn federated_user(
+        &self,
+        issuer: &str,
+        subject: &str,
+    ) -> Result<UserSummary, AuthError> {
+        let mut state = self.state.write().await;
+        let user = provision_federated(&mut state, issuer, subject, None)?;
+        Ok(summary(&user))
+    }
+
+    /// Issues a pull-only credential for one repository on behalf of its
+    /// owner, for a trusted service (Knotree Cloud image pulls). Credentials
+    /// with the same name and repository older than the previous one are
+    /// revoked, so rotation keeps at most two live.
+    pub async fn rotate_repository_pull_credential(
+        &self,
+        user_id: Uuid,
+        name: String,
+        repository: RepositoryName,
+        expires_at: Option<u64>,
+    ) -> Result<CredentialCreated, AuthError> {
+        let created = self
+            .issue_credential_for_user(
+                user_id,
+                name.clone(),
+                vec![RepositoryScope {
+                    repository: repository.clone(),
+                    actions: [Action::Pull].into_iter().collect(),
+                }],
+                expires_at,
+            )
+            .await?;
+        let mut state = self.state.write().await;
+        let mut previous: Vec<(Uuid, u64)> = state
+            .credentials
+            .values()
+            .filter(|credential| {
+                credential.user_id == user_id
+                    && credential.id != created.id
+                    && credential.name == name
+                    && credential.revoked_at.is_none()
+                    && credential.scopes.len() == 1
+                    && credential.scopes[0].repository == repository
+            })
+            .map(|credential| (credential.id, credential.issued_at_nanos))
+            .collect();
+        // Newest first; keep the most recent previous credential live.
+        previous.sort_by_key(|(_, issued)| std::cmp::Reverse(*issued));
+        let now = now_seconds();
+        for (id, _) in previous.into_iter().skip(1) {
+            if let Some(credential) = state.credentials.get_mut(&id) {
+                credential.revoked_at = Some(now);
+            }
+        }
+        Ok(created)
     }
 
     pub async fn login(&self, username: &str, password: &str) -> Result<Session, AuthError> {
@@ -683,6 +723,7 @@ impl AuthService {
             expires_at,
             revoked_at: None,
             last_used_at: None,
+            issued_at_nanos: now_nanos(),
         };
         let id = credential.id;
         let mut state = self.state.write().await;
@@ -745,6 +786,7 @@ impl AuthService {
                 expires_at,
                 revoked_at: None,
                 last_used_at: None,
+                issued_at_nanos: now_nanos(),
             },
         );
         Ok(CredentialCreated {
@@ -1087,6 +1129,59 @@ fn scopes_to_access(scopes: &[RepositoryScope]) -> Vec<AccessEntry> {
         .collect()
 }
 
+fn now_nanos() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map_or(0, |elapsed| {
+            u64::try_from(elapsed.as_nanos()).unwrap_or(u64::MAX)
+        })
+}
+
+fn provision_federated(
+    state: &mut AuthState,
+    issuer: &str,
+    subject: &str,
+    admin: Option<bool>,
+) -> Result<UserRecord, AuthError> {
+    if issuer.is_empty()
+        || issuer.len() > 2048
+        || subject.is_empty()
+        || subject.len() > 255
+        || issuer.chars().chain(subject.chars()).any(char::is_control)
+    {
+        return Err(AuthError::InvalidCredentials);
+    }
+    let identity = (issuer.to_owned(), subject.to_owned());
+    let identity_key =
+        serde_json::to_string(&identity).map_err(|_| AuthError::PersistentStateSerialization)?;
+    // Digest-derived namespace is stable across restarts and distinct providers.
+    let digest: String = raw_digest(&identity_key)
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect();
+    let username = format!("kt-{digest}")[..64].to_owned();
+    if let Some(user) = state.users.get_mut(&username) {
+        if user.federated_identity.as_ref() != Some(&identity) {
+            return Err(AuthError::InvalidCredentials);
+        }
+        if let Some(admin) = admin {
+            user.is_admin = admin;
+        }
+        return Ok(user.clone());
+    }
+    let user = UserRecord {
+        id: Uuid::new_v4(),
+        username: username.clone(),
+        password_hash: "!sso-only".into(),
+        is_admin: admin.unwrap_or(false),
+        federated_identity: Some(identity),
+        totp_secret: None,
+        totp_pending_secret: None,
+    };
+    state.users.insert(username, user.clone());
+    Ok(user)
+}
+
 fn summary(user: &UserRecord) -> UserSummary {
     UserSummary {
         id: user.id,
@@ -1146,6 +1241,30 @@ fn verify_password(encoded: &str, password: &str) -> Result<(), AuthError> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn allow_listed_subjects_are_admins_until_removed_from_the_list() {
+        let auth = AuthService::new("knotree-registry", "knotree-registry", 300);
+        let admin = auth
+            .login_federated_as("https://accounts.knotree.com", "ops-subject", true)
+            .await
+            .unwrap();
+        assert!(admin.user.is_admin);
+        assert!(auth.session_user(&admin.token).await.unwrap().is_admin);
+        // A trusted service acting for the account never changes the role.
+        assert!(
+            auth.federated_user("https://accounts.knotree.com", "ops-subject")
+                .await
+                .unwrap()
+                .is_admin
+        );
+        let demoted = auth
+            .login_federated_as("https://accounts.knotree.com", "ops-subject", false)
+            .await
+            .unwrap();
+        assert_eq!(demoted.user.id, admin.user.id);
+        assert!(!demoted.user.is_admin);
+    }
 
     #[tokio::test]
     async fn federated_users_are_stable_non_admin_and_cannot_grant_other_namespaces() {

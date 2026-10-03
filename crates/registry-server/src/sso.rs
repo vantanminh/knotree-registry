@@ -154,6 +154,8 @@ pub(crate) async fn configuration(State(state): State<AppState>) -> Json<serde_j
 #[serde(rename_all = "camelCase")]
 pub(crate) struct StartQuery {
     return_to: Option<String>,
+    /// `signup` opens Knotree account creation instead of sign-in.
+    intent: Option<String>,
 }
 
 fn safe_return_to(value: Option<&str>) -> String {
@@ -200,6 +202,9 @@ pub(crate) async fn start(
         .append_pair("state", &state_token)
         .append_pair("code_challenge", &challenge)
         .append_pair("code_challenge_method", "S256");
+    if query.intent.as_deref() == Some("signup") {
+        url.query_pairs_mut().append_pair("screen_hint", "signup");
+    }
     let mut response = Redirect::to(url.as_str()).into_response();
     response
         .headers_mut()
@@ -304,9 +309,14 @@ pub(crate) async fn callback(
     {
         return Err(invalid_login());
     }
+    let admin = state
+        .config
+        .sso_admin_subjects
+        .iter()
+        .any(|subject| subject == &profile.sub);
     let session = state
         .auth
-        .login_federated(&config.issuer, &profile.sub)
+        .login_federated_as(&config.issuer, &profile.sub, admin)
         .await?;
     let mut event = RegistryEvent::new(EventKind::LoginSucceeded);
     event.actor = Some(session.user.username.clone());

@@ -18,8 +18,24 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let config = AppConfig::from_env()?;
     let listener = TcpListener::bind(config.bind_addr).await?;
     let address = listener.local_addr()?;
+    let internal = config.internal.clone();
     let state = build_state(config).await?;
     let _webhook_worker = state.start_webhook_delivery_worker();
+    if let Some(internal) = internal {
+        // Cluster-only listener for trusted Knotree services. It is never
+        // exposed through the public ingress.
+        let internal_listener = TcpListener::bind(internal.bind_addr).await?;
+        tracing::info!(address = %internal_listener.local_addr()?, "internal API listening");
+        let internal_app = registry_server::internal::router(state.clone(), internal);
+        tokio::spawn(async move {
+            if let Err(error) = axum::serve(internal_listener, internal_app)
+                .with_graceful_shutdown(shutdown_signal())
+                .await
+            {
+                tracing::error!(error = %error, "internal API stopped");
+            }
+        });
+    }
     let app = router(state);
     tracing::info!(%address, "registry server listening");
     axum::serve(listener, app)

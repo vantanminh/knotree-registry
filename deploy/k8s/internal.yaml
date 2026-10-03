@@ -1,0 +1,78 @@
+# Cluster-only Registry API for trusted Knotree services (Knotree Cloud).
+# Applied on every deploy by deploy/ci/remote.sh.
+#
+# - Registry runs as its own ServiceAccount allowed to call TokenReview, so it
+#   can verify the projected ServiceAccount tokens that Cloud presents.
+# - The internal port is only on the `registry-internal` Service, never on the
+#   public ingress, and a NetworkPolicy admits only the knotree-cloud namespace.
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: registry
+  namespace: knotree-registry
+  labels:
+    app.kubernetes.io/name: registry
+    app.kubernetes.io/part-of: knotree-registry
+automountServiceAccountToken: true
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata:
+  name: knotree-registry-token-review
+  labels:
+    app.kubernetes.io/name: registry
+    app.kubernetes.io/part-of: knotree-registry
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: ClusterRole
+  name: system:auth-delegator
+subjects:
+  - kind: ServiceAccount
+    name: registry
+    namespace: knotree-registry
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: registry-internal
+  namespace: knotree-registry
+  labels:
+    app.kubernetes.io/name: registry
+    app.kubernetes.io/part-of: knotree-registry
+spec:
+  selector:
+    app.kubernetes.io/name: registry
+    app.kubernetes.io/part-of: knotree-registry
+  ports:
+    - name: internal
+      port: 8081
+      targetPort: internal
+---
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: registry
+  namespace: knotree-registry
+  labels:
+    app.kubernetes.io/name: registry
+    app.kubernetes.io/part-of: knotree-registry
+spec:
+  podSelector:
+    matchLabels:
+      app.kubernetes.io/name: registry
+      app.kubernetes.io/part-of: knotree-registry
+  policyTypes:
+    - Ingress
+  ingress:
+    # Public registry and UI traffic (ingress, probes, in-cluster pulls).
+    - ports:
+        - port: 8080
+          protocol: TCP
+    # Internal API: Knotree Cloud only.
+    - from:
+        - namespaceSelector:
+            matchLabels:
+              kubernetes.io/metadata.name: knotree-cloud
+      ports:
+        - port: 8081
+          protocol: TCP
