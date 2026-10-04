@@ -1,7 +1,11 @@
-import { FormEvent, useEffect, useMemo, useState } from "react";
-import { useNavigate, useParams, useSearchParams } from "react-router-dom";
-import { Token, api, friendlyError } from "./api";
+import { FormEvent, useMemo, useState } from "react";
+import { Link, useNavigate, useParams, useSearchParams } from "react-router-dom";
+import { AlertTriangle, ArrowLeft, KeyRound, Lock, Plus } from "lucide-react";
+import { Token, api, friendlyError, useResource } from "./api";
+import { formatAbsolute } from "./format";
+import { useSession } from "./session";
 import {
+  Callout,
   CommandBox,
   ConfirmDialog,
   CopyButton,
@@ -9,121 +13,167 @@ import {
   ErrorState,
   Modal,
   PageHeader,
+  Panel,
   RelativeTime,
   SearchInput,
+  Segmented,
   Skeleton,
   StatusBadge,
+  Tone,
   permissionHelp,
   useToast
 } from "./ui";
 
-export function TokensPage({ host, username }: { host: string; username: string }) {
-  const [tokens, setTokens] = useState<Token[] | null>(null);
-  const [error, setError] = useState("");
+type TokenState = { tone: Tone; label: string };
+
+function tokenState(token: Token): TokenState {
+  if (token.revoked_at) return { tone: "neutral", label: "Revoked" };
+  const now = Date.now() / 1000;
+  if (token.expires_at && token.expires_at < now) return { tone: "fail", label: "Expired" };
+  if (token.expires_at && token.expires_at - now < 7 * 86400) return { tone: "warn", label: "Expiring soon" };
+  return { tone: "ok", label: "Active" };
+}
+
+function Scopes({ token }: { token: Token }) {
+  return (
+    <>
+      {token.namespace_pull && (
+        <span className="scope">
+          <span className="repo">{token.namespace_pull}/*</span>
+          <span className="acts">pull</span>
+        </span>
+      )}
+      {token.scopes.map((scope) => (
+        <span className="scope" key={scope.repository}>
+          <span className="repo">{scope.repository}</span>
+          <span className="acts">{scope.actions.join(" · ")}</span>
+        </span>
+      ))}
+    </>
+  );
+}
+
+export function TokensPage() {
+  const { host, user } = useSession();
+  const { data, error, reload } = useResource<{ tokens: Token[] }>("/api/v1/auth/tokens");
   const [secret, setSecret] = useState<{ token: Token; secret: string } | null>(null);
   const [params, setParams] = useSearchParams();
   const create = params.get("create") === "1";
   const navigate = useNavigate();
   const query = params.get("q") ?? "";
-  function load() {
-    api<{ tokens: Token[] }>("/api/v1/auth/tokens")
-      .then((result) => setTokens(result.tokens))
-      .catch((reason) => setError(friendlyError(reason)));
+  const status = (params.get("status") as "active" | "all" | "revoked") ?? "active";
+  const tokens = data?.tokens;
+
+  function setParam(key: string, value: string) {
+    const next = new URLSearchParams(params);
+    if (value) next.set(key, value);
+    else next.delete(key);
+    setParams(next, { replace: true });
   }
-  useEffect(load, []);
-  const filtered = useMemo(
-    () =>
-      (tokens ?? []).filter(
-        (token) =>
-          !query ||
-          token.name.toLowerCase().includes(query.toLowerCase()) ||
-          token.prefix.includes(query) ||
-          token.scopes.some((scope) => scope.repository.includes(query))
-      ),
-    [tokens, query]
+
+  const counts = useMemo(
+    () => ({
+      active: (tokens ?? []).filter((token) => !token.revoked_at).length,
+      revoked: (tokens ?? []).filter((token) => token.revoked_at).length
+    }),
+    [tokens]
   );
-  if (error) return <ErrorState message={error} onRetry={load} />;
+  const filtered = useMemo(() => {
+    const q = query.toLowerCase();
+    return (tokens ?? []).filter(
+      (token) =>
+        (status === "all" || (status === "active" ? !token.revoked_at : !!token.revoked_at)) &&
+        (!q ||
+          token.name.toLowerCase().includes(q) ||
+          token.prefix.includes(q) ||
+          token.scopes.some((scope) => scope.repository.includes(q)))
+    );
+  }, [tokens, query, status]);
+
+  if (error) return <ErrorState message={error} onRetry={reload} />;
   if (!tokens) return <Skeleton />;
+
   return (
     <>
       <PageHeader
-        title="Access Tokens"
-        description="Create credentials for Docker CLI, CI systems and servers."
+        title="Access tokens"
+        description="Scoped credentials for Docker, CI pipelines and servers. Use one as the password for docker login."
         actions={
-          <button className="btn primary" onClick={() => setParams({ create: "1" })}>
-            Create Token
+          <button className="btn primary" onClick={() => setParam("create", "1")}>
+            <Plus size={14} /> New token
           </button>
         }
       />
-      <div className="filters">
-        <SearchInput
-          value={query}
-          onChange={(value) => {
-            const next = new URLSearchParams(params);
-            if (value) next.set("q", value);
-            else next.delete("q");
-            setParams(next, { replace: true });
-          }}
-          placeholder="Search tokens"
-        />
-      </div>
+      {tokens.length > 0 && (
+        <div className="toolbar">
+          <SearchInput value={query} onChange={(value) => setParam("q", value)} placeholder="Filter by name, prefix or repository" />
+          <span className="spacer" />
+          <Segmented
+            label="Status"
+            value={status}
+            onChange={(value) => setParam("status", value === "active" ? "" : value)}
+            options={[
+              { id: "active", label: `Active ${counts.active}` },
+              { id: "revoked", label: `Revoked ${counts.revoked}` },
+              { id: "all", label: "All" }
+            ]}
+          />
+        </div>
+      )}
       <section className="panel">
         {filtered.length ? (
           <div className="table-wrap">
             <table className="data">
               <thead>
                 <tr>
-                  <th>Name</th>
-                  <th>Type</th>
-                  <th>Scopes</th>
-                  <th>Expires</th>
-                  <th>Last used</th>
+                  <th>Token</th>
+                  <th>Access</th>
+                  <th className="hide-sm">Last used</th>
+                  <th className="hide-md">Expires</th>
                   <th>Status</th>
-                  <th></th>
+                  <th className="shrink" aria-label="Actions" />
                 </tr>
               </thead>
               <tbody>
-                {filtered.map((token) => (
-                  <tr key={token.id} onClick={() => navigate(`/security/tokens/${token.id}`)}>
-                    <td>
-                      <strong>{token.name}</strong>
-                      <div className="mono" style={{ color: "var(--muted)" }}>
-                        {token.prefix}••••••••
-                      </div>
-                    </td>
-                    <td>Personal</td>
-                    <td>
-                      {token.namespace_pull && (
-                        <span className="chip">{token.namespace_pull}/* · pull</span>
-                      )}
-                      {token.scopes.map((scope) => (
-                        <span className="chip" key={scope.repository}>
-                          {scope.repository} · {scope.actions.join(" ")}
-                        </span>
-                      ))}
-                    </td>
-                    <td>
-                      <RelativeTime value={token.expires_at} />
-                    </td>
-                    <td>
-                      <RelativeTime value={token.last_used_at} />
-                    </td>
-                    <td>
-                      <StatusBadge state={token.revoked_at ? "fail" : "ok"} label={token.revoked_at ? "Revoked" : "Active"} />
-                    </td>
-                    <td className="row-actions">{!token.revoked_at && <RevokeButton id={token.id} onDone={load} />}</td>
-                  </tr>
-                ))}
+                {filtered.map((token) => {
+                  const state = tokenState(token);
+                  return (
+                    <tr key={token.id} className="clickable" onClick={() => navigate(`/security/tokens/${token.id}`)}>
+                      <td>
+                        <div className="cell-stack">
+                          <span style={{ fontWeight: 500 }}>{token.name}</span>
+                          <small className="mono">{token.prefix}••••••</small>
+                        </div>
+                      </td>
+                      <td style={{ whiteSpace: "normal" }}>
+                        <Scopes token={token} />
+                      </td>
+                      <td className="hide-sm muted">
+                        <RelativeTime value={token.last_used_at} />
+                      </td>
+                      <td className="hide-md muted">{token.expires_at ? <RelativeTime value={token.expires_at} /> : "Never"}</td>
+                      <td>
+                        <StatusBadge dot state={state.tone} label={state.label} />
+                      </td>
+                      <td>
+                        <div className="row-actions">{!token.revoked_at && <RevokeButton id={token.id} name={token.name} onDone={reload} />}</div>
+                      </td>
+                    </tr>
+                  );
+                })}
               </tbody>
             </table>
           </div>
+        ) : tokens.length ? (
+          <EmptyState icon={<KeyRound size={18} />} title="No matching tokens" text="Try another filter." />
         ) : (
           <EmptyState
-            title="No access tokens"
-            text="Create a token to authenticate Docker, CI pipelines or deployment servers."
+            icon={<KeyRound size={18} />}
+            title="No access tokens yet"
+            text="Create a token to authenticate Docker, a CI pipeline or a deployment server."
             action={
-              <button className="btn primary" onClick={() => setParams({ create: "1" })}>
-                Create token
+              <button className="btn primary" onClick={() => setParam("create", "1")}>
+                <Plus size={14} /> New token
               </button>
             }
           />
@@ -131,31 +181,27 @@ export function TokensPage({ host, username }: { host: string; username: string 
       </section>
       {create && (
         <CreateTokenModal
-          onClose={() => {
-            params.delete("create");
-            setParams(params, { replace: true });
-          }}
+          onClose={() => setParam("create", "")}
           onCreated={(created) => {
-            params.delete("create");
-            setParams(params, { replace: true });
+            setParam("create", "");
             setSecret(created);
-            load();
+            reload();
           }}
         />
       )}
-      {secret && <TokenSecretModal host={host} username={username} secret={secret.secret} onClose={() => setSecret(null)} />}
+      {secret && <TokenSecretModal host={host} username={user.username} secret={secret.secret} name={secret.token.name} onClose={() => setSecret(null)} />}
     </>
   );
 }
 
-function RevokeButton({ id, onDone }: { id: string; onDone: () => void }) {
+function RevokeButton({ id, name, onDone, large }: { id: string; name: string; onDone: () => void; large?: boolean }) {
   const [open, setOpen] = useState(false);
   const [busy, setBusy] = useState(false);
   const toast = useToast();
   return (
     <>
       <button
-        className="btn sm danger"
+        className={`btn danger ${large ? "" : "sm"}`}
         onClick={(event) => {
           event.stopPropagation();
           setOpen(true);
@@ -164,31 +210,40 @@ function RevokeButton({ id, onDone }: { id: string; onDone: () => void }) {
         Revoke
       </button>
       {open && (
-        <ConfirmDialog
-          title="Revoke access token?"
-          text="Applications using this token will no longer be able to request new registry credentials."
-          confirmLabel="Revoke token"
-          danger
-          busy={busy}
-          onClose={() => setOpen(false)}
-          onConfirm={async () => {
-            setBusy(true);
-            try {
-              await api(`/api/v1/auth/tokens/${id}/revoke`, { method: "POST" });
-              toast("Token revoked");
-              setOpen(false);
-              onDone();
-            } catch (reason) {
-              toast(friendlyError(reason), "error");
-            } finally {
-              setBusy(false);
-            }
-          }}
-        />
+        <div onClick={(event) => event.stopPropagation()}>
+          <ConfirmDialog
+            title={`Revoke “${name}”?`}
+            text="Anything using this token stops being able to pull or push immediately. This cannot be undone."
+            confirmLabel="Revoke token"
+            danger
+            busy={busy}
+            onClose={() => setOpen(false)}
+            onConfirm={async () => {
+              setBusy(true);
+              try {
+                await api(`/api/v1/auth/tokens/${id}/revoke`, { method: "POST" });
+                toast("Token revoked");
+                setOpen(false);
+                onDone();
+              } catch (reason) {
+                toast(friendlyError(reason), "error");
+              } finally {
+                setBusy(false);
+              }
+            }}
+          />
+        </div>
       )}
     </>
   );
 }
+
+const expiryOptions = [
+  { id: "2592000", label: "30 days" },
+  { id: "7776000", label: "90 days" },
+  { id: "31536000", label: "1 year" },
+  { id: "never", label: "Never" }
+];
 
 function CreateTokenModal({
   onClose,
@@ -200,14 +255,12 @@ function CreateTokenModal({
   const [name, setName] = useState("");
   const [repository, setRepository] = useState("");
   const [actions, setActions] = useState<string[]>(["pull"]);
-  const [ttl, setTtl] = useState("never");
+  const [ttl, setTtl] = useState("7776000");
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState("");
-  function toggle(action: string, enabled: boolean) {
-    setActions((current) => {
-      const next = enabled ? [...new Set([...current, action])] : current.filter((item) => item !== action);
-      return next.includes("pull") ? next : ["pull", ...next];
-    });
+  function toggle(action: string) {
+    if (action === "pull") return;
+    setActions((current) => (current.includes(action) ? current.filter((item) => item !== action) : [...current, action]));
   }
   async function submit(event: FormEvent) {
     event.preventDefault();
@@ -217,11 +270,7 @@ function CreateTokenModal({
     try {
       const result = await api<Token & { secret: string }>("/api/v1/auth/tokens", {
         method: "POST",
-        body: JSON.stringify({
-          name,
-          scopes: [{ repository, actions }],
-          expires_at
-        })
+        body: JSON.stringify({ name, scopes: [{ repository, actions }], expires_at })
       });
       onCreated({ token: result, secret: result.secret });
     } catch (reason) {
@@ -230,9 +279,12 @@ function CreateTokenModal({
       setBusy(false);
     }
   }
+  const risky = actions.includes("delete") || actions.includes("admin");
+  const expiresOn = ttl === "never" ? null : Math.floor(Date.now() / 1000) + Number(ttl);
   return (
     <Modal
-      title="Create access token"
+      title="New access token"
+      description="The secret is shown once, right after you create it."
       onClose={onClose}
       wide
       footer={
@@ -240,61 +292,62 @@ function CreateTokenModal({
           <button className="btn ghost" onClick={onClose}>
             Cancel
           </button>
-          <button className="btn primary" form="create-token" disabled={busy}>
+          <button className="btn primary" form="create-token" disabled={busy || !name || !repository}>
             {busy ? "Creating…" : "Create token"}
           </button>
         </>
       }
     >
-      <form id="create-token" className="stack" onSubmit={submit}>
+      <form id="create-token" className="form-grid" onSubmit={submit}>
         <label className="field">
-          <span>Token name</span>
-          <input value={name} onChange={(event) => setName(event.target.value)} required />
-        </label>
-        <label className="field">
-          <span>Token type</span>
-          <select defaultValue="personal">
-            <option value="personal">Personal</option>
-            <option value="robot" disabled>
-              Robot (not available)
-            </option>
-          </select>
+          <span>Name</span>
+          <input value={name} onChange={(event) => setName(event.target.value)} required autoFocus placeholder="e.g. github-actions-api" />
+          <small>Something that tells you where it's used.</small>
         </label>
         <label className="field">
           <span>Repository</span>
-          <small>Use a repository name such as production/api. Wildcards are not accepted by the control plane.</small>
-          <input value={repository} onChange={(event) => setRepository(event.target.value)} required placeholder="lowercase/name" />
+          <input
+            value={repository}
+            onChange={(event) => setRepository(event.target.value.toLowerCase())}
+            required
+            placeholder="production/api"
+            className="mono"
+            spellCheck={false}
+          />
+          <small>One exact repository path. Wildcards are not accepted.</small>
         </label>
-        <div className="perm">
-          {["pull", "push", "delete", "admin"].map((action) => (
-            <label key={action} className={`perm-item ${action === "delete" || action === "admin" ? "warn" : ""}`}>
-              <input
-                type="checkbox"
-                checked={actions.includes(action)}
-                disabled={action === "pull"}
-                onChange={(event) => toggle(action, event.target.checked)}
-              />
-              <div>
-                <strong style={{ textTransform: "capitalize" }}>{action}</strong>
-                <div style={{ color: "var(--muted)", fontSize: 13 }}>{permissionHelp(action)}</div>
-              </div>
-            </label>
-          ))}
+        <div className="field">
+          <span>Permissions</span>
+          <div className="choices">
+            {["pull", "push", "delete", "admin"].map((action) => {
+              const on = actions.includes(action);
+              const danger = action === "delete" || action === "admin";
+              return (
+                <label key={action} className={`choice ${on ? "on" : ""} ${action === "pull" ? "locked" : ""}`}>
+                  <input type="checkbox" checked={on} disabled={action === "pull"} onChange={() => toggle(action)} />
+                  <div>
+                    <strong>{action}</strong>
+                    <small>{action === "pull" ? "Always included." : permissionHelp(action)}</small>
+                  </div>
+                  {danger && <AlertTriangle size={14} className="risk" style={{ color: "var(--warn)" }} aria-label="Sensitive" />}
+                </label>
+              );
+            })}
+          </div>
         </div>
-        {(actions.includes("delete") || actions.includes("admin")) && (
-          <div className="alert warn">Delete and admin permissions can destroy images or change access. Grant them only when required.</div>
+        {risky && (
+          <Callout tone="warn">
+            <strong>Delete and admin can destroy images or change access.</strong> Grant them only to automation that needs them.
+          </Callout>
         )}
-        <label className="field">
+        <div className="field">
           <span>Expiration</span>
-          <select value={ttl} onChange={(event) => setTtl(event.target.value)}>
-            <option value="never">No expiration</option>
-            <option value="86400">1 day</option>
-            <option value="604800">7 days</option>
-            <option value="2592000">30 days</option>
-            <option value="31536000">1 year</option>
-          </select>
-        </label>
-        {error && <div className="alert error">{error}</div>}
+          <div className="row">
+            <Segmented label="Expiration" value={ttl} onChange={setTtl} options={expiryOptions} />
+            <small className="muted">{expiresOn ? `Expires ${formatAbsolute(expiresOn).split(",").slice(0, 2).join(",")}` : "Never expires — revoke it manually."}</small>
+          </div>
+        </div>
+        {error && <Callout tone="error">{error}</Callout>}
       </form>
     </Modal>
   );
@@ -304,96 +357,131 @@ function TokenSecretModal({
   host,
   username,
   secret,
+  name,
   onClose
 }: {
   host: string;
   username: string;
   secret: string;
+  name: string;
   onClose: () => void;
 }) {
   return (
     <Modal
-      title="Token created"
+      title={`“${name}” is ready`}
+      description="Copy the secret now — you won't be able to see it again."
       onClose={onClose}
       footer={
         <button className="btn primary" onClick={onClose}>
-          I've saved my token
+          I've stored it safely
         </button>
       }
     >
-      <div className="alert warn">This token will only be shown once. Copy it now and store it somewhere safe.</div>
-      <div className="secret-box">{secret}</div>
-      <CopyButton value={secret} label="Copy token" />
-      <h3>Docker login</h3>
-      <CommandBox command={`docker login ${host} -u ${username}`} />
-      <p style={{ color: "var(--muted)", fontSize: 13 }}>Paste the token when Docker asks for your password. Do not put the secret on the command line.</p>
+      <div className="secret">
+        <Lock size={14} className="muted" />
+        <code>{secret}</code>
+        <CopyButton className="btn sm" value={secret} label="Copy" />
+      </div>
+      <CommandBox label="Log in with it" command={`docker login ${host} -u ${username}`} />
+      <p className="muted" style={{ fontSize: 12.5 }}>
+        Paste the token when Docker prompts for a password. In CI, pipe it with <code>--password-stdin</code> instead of putting it on the command line.
+      </p>
     </Modal>
   );
 }
 
 export function TokenDetailPage() {
   const { id } = useParams();
-  const [token, setToken] = useState<Token | null>(null);
-  const [error, setError] = useState("");
+  const { host, user } = useSession();
+  const { data, error, reload } = useResource<{ tokens: Token[] }>("/api/v1/auth/tokens");
   const navigate = useNavigate();
-  function load() {
-    api<{ tokens: Token[] }>("/api/v1/auth/tokens")
-      .then((result) => setToken(result.tokens.find((item) => item.id === id) ?? null))
-      .catch((reason) => setError(friendlyError(reason)));
+  if (error) return <ErrorState message={error} onRetry={reload} />;
+  if (!data) return <Skeleton />;
+  const token = data.tokens.find((item) => item.id === id);
+  if (!token) {
+    return (
+      <EmptyState
+        icon={<KeyRound size={18} />}
+        title="Token not found"
+        text="It may have been deleted, or it belongs to another account."
+        action={
+          <Link className="btn" to="/security/tokens">
+            <ArrowLeft size={14} /> All tokens
+          </Link>
+        }
+      />
+    );
   }
-  useEffect(load, [id]);
-  if (error) return <ErrorState message={error} onRetry={load} />;
-  if (!token) return <Skeleton />;
+  const state = tokenState(token);
   return (
     <>
       <PageHeader
+        eyebrow={
+          <Link className="inline-link" to="/security/tokens">
+            Access tokens
+          </Link>
+        }
         title={token.name}
-        description={`${token.prefix}••••••••`}
-        actions={!token.revoked_at && <RevokeButton id={token.id} onDone={() => navigate("/security/tokens")} />}
+        badge={<StatusBadge dot state={state.tone} label={state.label} />}
+        description={<span className="mono">{token.prefix}••••••••</span>}
+        actions={!token.revoked_at && <RevokeButton large id={token.id} name={token.name} onDone={() => navigate("/security/tokens")} />}
       />
-      <section className="panel panel-pad grid-gap">
-        <div className="meta-row">
-          <div>
-            <span>Status</span>
-            <StatusBadge state={token.revoked_at ? "fail" : "ok"} label={token.revoked_at ? "Revoked" : "Active"} />
+      <div className="grid">
+        <Panel className="span-7" title="Repository access" description="What this token can do, as requested from the token service.">
+          <div className="panel-body stack-lg">
+            {token.namespace_pull && (
+              <div>
+                <Scopes token={{ ...token, scopes: [] }} />
+                <div className="muted" style={{ fontSize: 12.5, marginTop: 6 }}>Pull from every repository in this namespace (Knotree Cloud grant).</div>
+              </div>
+            )}
+            {token.scopes.map((scope) => (
+              <div key={scope.repository} className="stack-sm">
+                <div className="row" style={{ justifyContent: "space-between" }}>
+                  <Link className="inline-link mono" to={`/repositories/${scope.repository}`}>
+                    {scope.repository}
+                  </Link>
+                  <span className="row" style={{ gap: 4 }}>
+                    {scope.actions.map((action) => (
+                      <StatusBadge key={action} state={action === "delete" || action === "admin" ? "warn" : "neutral"} label={action} />
+                    ))}
+                  </span>
+                </div>
+                <code className="muted" style={{ fontSize: 12 }}>repository:{scope.repository}:{scope.actions.join(",")}</code>
+              </div>
+            ))}
           </div>
-          <div>
-            <span>Expires</span>
-            <strong>
-              <RelativeTime value={token.expires_at} />
-            </strong>
+        </Panel>
+        <Panel className="span-5" title="Details">
+          <div className="panel-body">
+            <dl className="kv compact">
+              <dt>Prefix</dt>
+              <dd className="mono">{token.prefix}</dd>
+              <dt>Last used</dt>
+              <dd>
+                <RelativeTime value={token.last_used_at} />
+              </dd>
+              <dt>Expires</dt>
+              <dd>{token.expires_at ? formatAbsolute(token.expires_at) : "Never"}</dd>
+              {token.revoked_at && (
+                <>
+                  <dt>Revoked</dt>
+                  <dd>{formatAbsolute(token.revoked_at)}</dd>
+                </>
+              )}
+              <dt>ID</dt>
+              <dd className="mono muted" style={{ fontSize: 12 }}>{token.id}</dd>
+            </dl>
           </div>
-          <div>
-            <span>Last used</span>
-            <strong>
-              <RelativeTime value={token.last_used_at} />
-            </strong>
-          </div>
-        </div>
-        <div>
-          <h3>Repository access</h3>
-          {token.namespace_pull && (
-            <div style={{ marginTop: 12 }}>
-              <span className="chip">{token.namespace_pull}/*</span>
-              <span className="chip">pull</span>
+        </Panel>
+        {!token.revoked_at && (
+          <Panel className="span-12" title="Use it" description="The secret is only shown at creation. If you lost it, revoke this token and create a new one.">
+            <div className="panel-body">
+              <CommandBox command={`echo "$KNOTREE_TOKEN" | docker login ${host} -u ${user.username} --password-stdin`} />
             </div>
-          )}
-          {token.scopes.map((scope) => (
-            <div key={scope.repository} style={{ marginTop: 12 }}>
-              <span className="chip">{scope.repository}</span>
-              {scope.actions.map((action) => (
-                <span className="chip" key={action}>
-                  {action}
-                </span>
-              ))}
-              <details className="details" style={{ marginTop: 8 }}>
-                <summary>Advanced</summary>
-                <code>repository:{scope.repository}:{scope.actions.join(",")}</code>
-              </details>
-            </div>
-          ))}
-        </div>
-      </section>
+          </Panel>
+        )}
+      </div>
     </>
   );
 }

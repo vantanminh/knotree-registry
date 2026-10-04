@@ -1,3 +1,5 @@
+import { useCallback, useEffect, useState } from "react";
+
 export type User = { id: string; username: string; is_admin: boolean };
 export type Scope = { repository: string; actions: string[] };
 export type Token = {
@@ -132,4 +134,24 @@ export function friendlyError(error: unknown): string {
     return "The registry API did not respond.";
   }
   return apiError.message || "Something went wrong.";
+}
+
+/** Fetch a JSON resource on mount and whenever `path` changes. */
+export function useResource<T>(path: string | null) {
+  const [data, setData] = useState<T | null>(null);
+  const [error, setError] = useState("");
+  const [version, setVersion] = useState(0);
+  useEffect(() => {
+    if (!path) return;
+    let live = true;
+    setError("");
+    api<T>(path)
+      .then((value) => live && setData(value))
+      .catch((reason) => live && setError(friendlyError(reason)));
+    return () => {
+      live = false;
+    };
+  }, [path, version]);
+  const reload = useCallback(() => setVersion((value) => value + 1), []);
+  return { data, error, reload, setData };
 }

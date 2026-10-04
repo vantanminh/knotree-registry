@@ -26,11 +26,14 @@ export function formatAbsolute(epoch?: number | null): string {
 export function formatRelative(epoch?: number | null, now = Date.now()): string {
   if (!epoch) return "Never";
   const delta = Math.round(now / 1000 - epoch);
-  if (delta < 10) return "just now";
-  if (delta < 60) return `${delta}s ago`;
-  if (delta < 3600) return `${Math.floor(delta / 60)}m ago`;
-  if (delta < 86400) return `${Math.floor(delta / 3600)}h ago`;
-  if (delta < 30 * 86400) return `${Math.floor(delta / 86400)}d ago`;
+  const future = delta < 0;
+  const abs = Math.abs(delta);
+  const say = (text: string) => (future ? `in ${text}` : `${text} ago`);
+  if (abs < 10) return "just now";
+  if (abs < 60) return say(`${abs}s`);
+  if (abs < 3600) return say(`${Math.floor(abs / 60)}m`);
+  if (abs < 86400) return say(`${Math.floor(abs / 3600)}h`);
+  if (abs < 30 * 86400) return say(`${Math.floor(abs / 86400)}d`);
   return new Date(epoch * 1000).toLocaleDateString(undefined, { year: "numeric", month: "short", day: "numeric" });
 }
 
@@ -79,4 +82,18 @@ export function validateRepositoryName(value: string): string | null {
     return "Use lowercase letters, numbers, '.', '_' or '-', separated by '/'.";
   }
   return null;
+}
+
+export function splitBytes(value = 0): { value: string; unit: string } {
+  const [number, unit] = formatBytes(value).split(" ");
+  return { value: number, unit };
+}
+
+export function formatDuration(seconds: number): string {
+  if (seconds < 60) return `${seconds}s`;
+  const minutes = Math.floor(seconds / 60);
+  if (minutes < 60) return `${minutes}m`;
+  const hours = Math.floor(minutes / 60);
+  if (hours < 48) return `${hours}h ${minutes % 60}m`;
+  return `${Math.floor(hours / 24)}d ${hours % 24}h`;
 }
