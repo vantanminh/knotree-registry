@@ -7,7 +7,6 @@ import {
   Box,
   Boxes,
   ChevronsUpDown,
-  CircleDot,
   Cloud,
   HardDrive,
   KeyRound,
@@ -31,7 +30,7 @@ import {
 } from "lucide-react";
 import { Instance, User, api } from "./api";
 import { CloudConnectionPage } from "./pages-cloud";
-import { ActivityPage, LoginPage, OverviewPage, StatusPage } from "./pages-overview";
+import { ActivityPage, LoginPage, OverviewPage } from "./pages-overview";
 import { NamespacesPage, RepositoriesPage, RepositoryDetailPage } from "./pages-repos";
 import { TokenDetailPage, TokensPage } from "./pages-tokens";
 import {
@@ -106,8 +105,7 @@ const titles: Record<string, string> = {
   general: "General",
   registry: "Registry",
   retention: "Retention",
-  account: "Account",
-  status: "System status"
+  account: "Account"
 };
 
 export default function App() {
@@ -137,7 +135,7 @@ export default function App() {
           <Route path="/settings/retention" element={<SettingsPage />} />
           <Route path="/settings/security" element={<SecuritySettingsPage />} />
           <Route path="/account/security" element={<SecuritySettingsPage />} />
-          <Route path="/status" element={<StatusPage />} />
+          <Route path="/status" element={<Navigate to="/" replace />} />
           <Route path="*" element={<Navigate to="/" replace />} />
         </Route>
       </Routes>
@@ -200,7 +198,7 @@ function Shell() {
 }
 
 function Chrome({ session }: { session: Session }) {
-  const { user, instance, host } = session;
+  const { user, host } = session;
   const [menuOpen, setMenuOpen] = useState(false);
   const [palette, setPalette] = useState(false);
   const { collapsed, setCollapsed } = useCollapsed();
@@ -279,10 +277,6 @@ function Chrome({ session }: { session: Session }) {
           ))}
         </nav>
         <div className="sidebar-foot">
-          <Link className={location.pathname === "/status" ? "nav-item active" : "nav-item"} to="/status" title={collapsed ? "System status" : undefined}>
-            <CircleDot />
-            <span className="hide-collapsed">System status</span>
-          </Link>
           <UserMenu user={user} theme={theme} setTheme={setTheme} onLogout={logout} />
         </div>
       </aside>
@@ -302,10 +296,6 @@ function Chrome({ session }: { session: Session }) {
           </button>
           <Breadcrumbs path={location.pathname} />
           <div className="top-actions">
-            <span className="env-pill desktop-only" title="Environment">
-              <i className="dot ok" style={{ width: 6, height: 6, flexBasis: 6, boxShadow: "none" }} />
-              {instance?.environment ?? "registry"}
-            </span>
             <button className="btn icon ghost mobile-only" onClick={() => setPalette(true)} aria-label="Search">
               <Search size={16} />
             </button>
@@ -490,7 +480,6 @@ function CommandPalette({
       },
       hint: "Copy"
     },
-    { group: "Actions", label: "View system status", icon: <CircleDot />, run: () => onNavigate("/status") },
     { group: "Actions", label: "Switch to light theme", icon: <Sun />, run: () => { setTheme("light"); onClose(); }, keywords: "appearance" },
     { group: "Actions", label: "Switch to dark theme", icon: <Moon />, run: () => { setTheme("dark"); onClose(); }, keywords: "appearance" },
     { group: "Actions", label: "Use system theme", icon: <Monitor />, run: () => { setTheme("system"); onClose(); }, keywords: "appearance" }

@@ -158,7 +158,38 @@ pub fn router(state: AppState, config: InternalConfig) -> Router {
         .route("/internal/v1/repositories/{*repository}", get(tags))
         .route("/internal/v1/manifest", get(manifest))
         .route("/internal/v1/pull-credentials", post(pull_credential))
+        .route("/internal/v1/health", get(health))
+        .route("/metrics", get(metrics))
         .with_state(internal)
+}
+
+/// Per-component readiness for operators. The public `/readyz` only says
+/// whether Registry is ready, so storage and database state stay off the
+/// internet; this cluster-only port is where they are inspected.
+async fn health(State(internal): State<Internal>) -> Response {
+    let readiness = internal.state.readiness().await;
+    let status = if readiness.status == "ok" {
+        axum::http::StatusCode::OK
+    } else {
+        axum::http::StatusCode::SERVICE_UNAVAILABLE
+    };
+    let body = json!({
+        "status": readiness.status,
+        "storage": readiness.storage,
+        "database": readiness.database,
+        "uptime_seconds": internal.state.started_at.elapsed().as_secs(),
+        "version": env!("CARGO_PKG_VERSION"),
+    });
+    (status, Json(body)).into_response()
+}
+
+/// Prometheus counters, scraped inside the cluster only.
+async fn metrics(State(internal): State<Internal>) -> Response {
+    (
+        [(header::CONTENT_TYPE, "text/plain; version=0.0.4")],
+        internal.state.metrics.render_prometheus(),
+    )
+        .into_response()
 }
 
 fn kubernetes_client() -> reqwest::Client {
@@ -518,6 +549,36 @@ mod tests {
             },
         };
         assert!(wrong_caller.validate(true).is_err());
+    }
+
+    #[tokio::test]
+    async fn operator_health_and_metrics_live_on_the_internal_port() {
+        let state = AppState::initialize(crate::routes::tests::test_config())
+            .await
+            .unwrap();
+        let app = router(
+            state,
+            InternalConfig {
+                bind_addr: "127.0.0.1:0".parse().unwrap(),
+                auth: InternalAuth::DevToken(TOKEN.into()),
+            },
+        );
+        let (status, body) = call(app.clone(), "GET", "/internal/v1/health", None, "", None).await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(body["storage"], "ok");
+        assert_eq!(body["database"], "skipped");
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .uri("/metrics")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let text = to_bytes(response.into_body(), 64 * 1024).await.unwrap();
+        assert!(String::from_utf8_lossy(&text).contains("knotree_registry_requests_total"));
     }
 
     #[tokio::test]

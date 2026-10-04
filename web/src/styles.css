@@ -440,18 +440,6 @@ kbd, .kbd {
 .crumbs .sep { color: var(--faint); }
 .crumbs .current { color: var(--text); font-weight: 500; overflow: hidden; text-overflow: ellipsis; }
 .top-actions { display: flex; align-items: center; gap: 6px; }
-.env-pill {
-  display: inline-flex;
-  align-items: center;
-  gap: 6px;
-  height: 24px;
-  padding: 0 9px;
-  border-radius: 999px;
-  border: 1px solid var(--border);
-  font-size: 12px;
-  color: var(--text-2);
-  font-family: var(--mono);
-}
 .content { width: 100%; max-width: 1360px; margin: 0 auto; padding: 28px 32px 64px; animation: enter 220ms var(--ease); }
 @keyframes enter { from { opacity: 0; transform: translateY(3px); } to { opacity: 1; transform: none; } }
 .mobile-only { display: none !important; }
@@ -822,19 +810,6 @@ table.data tr.group-row td { height: 32px; background: var(--surface-2); font-si
 .meta-strip span { display: block; color: var(--muted); font-size: 12px; margin-bottom: 3px; }
 .meta-strip strong { font-size: 13.5px; font-weight: 500; }
 
-/* ---------- health ---------- */
-.health { display: grid; }
-.health-row { display: flex; align-items: center; gap: 12px; padding: 11px 18px; border-top: 1px solid var(--border); font-size: 13px; }
-.health-row:first-child { border-top: 0; }
-.health-row .name { flex: 1; }
-.health-row .state { color: var(--text-2); font-size: 12.5px; }
-.status-hero { display: flex; align-items: center; gap: 14px; padding: 20px; }
-.status-hero .big-dot { width: 36px; height: 36px; border-radius: 50%; display: grid; place-items: center; }
-.status-hero .big-dot.ok { background: var(--ok-soft); color: var(--ok); }
-.status-hero .big-dot.warn { background: var(--warn-soft); color: var(--warn); }
-.status-hero .big-dot.fail { background: var(--danger-soft); color: var(--danger); }
-.status-hero h2 { font-size: 16px; font-weight: 600; letter-spacing: -0.02em; }
-.status-hero p { color: var(--muted); font-size: 13px; }
 
 /* ---------- feed ---------- */
 .feed { display: grid; }

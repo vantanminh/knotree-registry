@@ -262,23 +262,6 @@ export function StatusBadge({ state, label, dot = false }: { state: Tone; label:
   );
 }
 
-export function healthTone(status: string): "ok" | "warn" | "fail" {
-  if (["ok", "healthy", "operational", "skipped"].includes(status)) return "ok";
-  if (["failed", "not_ready", "missing"].includes(status)) return "fail";
-  return "warn";
-}
-
-export function healthLabel(status: string): string {
-  const tone = healthTone(status);
-  if (tone === "ok") return status === "skipped" ? "Not required" : "Operational";
-  if (tone === "fail") return "Down";
-  return status.replaceAll("_", " ");
-}
-
-export function HealthDot({ status }: { status: string }) {
-  return <i className={`dot ${healthTone(status)}`} aria-hidden />;
-}
-
 /* ---------- states ---------- */
 
 export function EmptyState({

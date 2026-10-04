@@ -48,7 +48,6 @@ export type AuditEvent = {
   metadata: Record<string, unknown>;
 };
 export type Webhook = { id: string; url: string; events: string[]; enabled: boolean; created_at: number };
-export type Health = { status: string; storage: string; database: string };
 export type Overview = {
   user: User;
   repository_count: number;
@@ -58,19 +57,10 @@ export type Overview = {
   unreferenced_bytes: number;
   active_token_count: number;
   events: AuditEvent[];
-  health: Health;
-  uptime_seconds: number;
 };
 export type Instance = {
   public_url: string;
   registry_host: string;
-  environment: string;
-  storage_backend: string;
-  storage_bucket: string | null;
-  pull_mode: string;
-  token_service: string;
-  token_ttl_seconds: number;
-  registration: string;
 };
 export type StorageOverview = {
   repository_count: number;
@@ -82,7 +72,6 @@ export type StorageOverview = {
 export type UploadSession = {
   id: string;
   repository: string;
-  staging_key: string;
   offset: number;
   expires_at: number;
   status: string;
