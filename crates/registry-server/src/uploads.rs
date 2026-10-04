@@ -61,6 +61,8 @@ pub enum UploadStatusKind {
 pub struct UploadStatus {
     pub id: Uuid,
     pub repository: RepositoryName,
+    /// Internal object-store layout; never sent to clients.
+    #[serde(skip_serializing)]
     pub staging_key: String,
     pub offset: u64,
     pub expires_at: u64,

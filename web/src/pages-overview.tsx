@@ -5,20 +5,16 @@ import {
   ArrowRight,
   ArrowUpRight,
   Box,
-  CheckCircle2,
-  Clock,
-  Database,
   HardDrive,
   KeyRound,
   Layers,
   ShieldCheck,
   Tags,
-  XCircle,
   Zap
 } from "lucide-react";
 import { AuditEvent, Overview, useResource } from "./api";
 import { ActivityFeed, dailyCounts, eventMeta, eventResource } from "./events";
-import { formatBytes, formatDuration, splitBytes } from "./format";
+import { formatBytes, splitBytes } from "./format";
 import { useSession } from "./session";
 import {
   CommandBox,
@@ -26,7 +22,6 @@ import {
   Drawer,
   EmptyState,
   ErrorState,
-  HealthDot,
   Logo,
   Meter,
   PageHeader,
@@ -38,18 +33,8 @@ import {
   Stats,
   StatusBadge,
   TagPill,
-  healthLabel,
-  healthTone,
   useCopy
 } from "./ui";
-
-function healthRows(data: Overview) {
-  return [
-    { name: "Registry API", detail: "OCI distribution + control plane", status: data.health.status, icon: <Zap size={15} /> },
-    { name: "Database", detail: "Metadata, tokens, audit", status: data.health.database, icon: <Database size={15} /> },
-    { name: "Object storage", detail: "Blobs and manifests", status: data.health.storage, icon: <HardDrive size={15} /> }
-  ];
-}
 
 export function OverviewPage() {
   const { host, user } = useSession();
@@ -65,8 +50,6 @@ export function OverviewPage() {
   if (overview.error) return <ErrorState message={overview.error} onRetry={overview.reload} />;
   if (!data) return <Skeleton rows={6} stats />;
 
-  const rows = healthRows(data);
-  const allOk = rows.every((row) => healthTone(row.status) === "ok");
   const tagCount = data.repositories.reduce((sum, repo) => sum + (repo.tag_count ?? 0), 0);
   const pushes = buckets.reduce((sum, bucket) => sum + bucket.pushes, 0);
   const recent = [...data.repositories].sort((a, b) => (b.updated_at ?? 0) - (a.updated_at ?? 0)).slice(0, 6);
@@ -77,12 +60,6 @@ export function OverviewPage() {
   return (
     <>
       <PageHeader
-        eyebrow={
-          <>
-            <span className={`dot ${allOk ? "ok" : "warn"}`} style={{ width: 6, height: 6, flexBasis: 6, boxShadow: "none" }} />
-            {allOk ? "All systems operational" : "Degraded — check system status"}
-          </>
-        }
         title="Overview"
         description={
           <>
@@ -114,10 +91,12 @@ export function OverviewPage() {
             label: "Stored",
             icon: <HardDrive />,
             ...splitBytes(data.storage_bytes),
-            detail: data.unreferenced_bytes ? `${formatBytes(data.unreferenced_bytes)} reclaimable` : "Nothing to reclaim"
+            detail:
+              user.is_admin && data.unreferenced_bytes
+                ? `${formatBytes(data.unreferenced_bytes)} reclaimable`
+                : `Across ${data.repository_count} ${data.repository_count === 1 ? "repository" : "repositories"}`
           },
-          { label: "Active tokens", icon: <KeyRound />, value: data.active_token_count, detail: <Link to="/security/tokens">Manage access</Link> },
-          { label: "Uptime", icon: <Clock />, value: formatDuration(data.uptime_seconds), detail: "Since last restart" }
+          { label: "Active tokens", icon: <KeyRound />, value: data.active_token_count, detail: <Link to="/security/tokens">Manage access</Link> }
         ]}
       />
 
@@ -143,33 +122,36 @@ export function OverviewPage() {
           </div>
         </Panel>
 
-        <Panel
-          className="span-4"
-          title="System health"
-          description="Live readiness checks."
-          actions={
-            <Link className="btn sm ghost" to="/status">
-              Details <ArrowUpRight size={13} />
+        <Panel className="span-4" title="Push an image" description="Authenticate with an access token as the password.">
+          <div className="panel-body">
+            <ol className="steps">
+              <li>
+                <div>
+                  <strong>Sign in to the registry</strong>
+                  <CommandBox command={`docker login ${host} -u ${user.username}`} />
+                </div>
+              </li>
+              <li>
+                <div>
+                  <strong>Tag your image</strong>
+                  <CommandBox command={`docker tag app ${host}/team/app:1.0`} />
+                </div>
+              </li>
+              <li>
+                <div>
+                  <strong>Push</strong>
+                  <CommandBox command={`docker push ${host}/team/app:1.0`} />
+                </div>
+              </li>
+            </ol>
+          </div>
+          <div className="panel-foot">
+            <span>Need a password?</span>
+            <Link className="btn sm" to="/security/tokens?create=1">
+              <KeyRound size={13} /> Create token
             </Link>
-          }
-        >
-          <div className="health">
-            {rows.map((row) => (
-              <div className="health-row" key={row.name}>
-                <span className="muted" style={{ display: "grid" }}>{row.icon}</span>
-                <span className="name">
-                  {row.name}
-                  <div className="muted" style={{ fontSize: 12 }}>{row.detail}</div>
-                </span>
-                <span className="row" style={{ gap: 8 }}>
-                  <span className="state">{healthLabel(row.status)}</span>
-                  <HealthDot status={row.status} />
-                </span>
-              </div>
-            ))}
           </div>
         </Panel>
-
         <Panel
           className="span-8"
           title="Recently pushed"
@@ -241,8 +223,10 @@ export function OverviewPage() {
               <span style={{ fontSize: 22, fontWeight: 600, letterSpacing: "-0.03em" }} className="tnum">
                 {formatBytes(data.storage_bytes)}
               </span>
-              <span className="muted" style={{ fontSize: 12.5 }}>in object storage</span>
+              <span className="muted" style={{ fontSize: 12.5 }}>stored</span>
             </div>
+            {user.is_admin && (
+              <>
             <Meter
               parts={[
                 { label: "Referenced", value: data.referenced_bytes, color: "var(--text-2)" },
@@ -261,6 +245,8 @@ export function OverviewPage() {
                 <span>{formatBytes(data.unreferenced_bytes)}</span>
               </div>
             </div>
+              </>
+            )}
             {unrefShare > 0.15 && user.is_admin && (
               <Link className="btn sm full" style={{ marginTop: 14 }} to="/operations/garbage-collection">
                 Reclaim {Math.round(unrefShare * 100)}% with garbage collection
@@ -268,7 +254,7 @@ export function OverviewPage() {
             )}
             {largest.length > 0 && (
               <>
-                <div className="section-title" style={{ marginTop: 20 }}>Largest repositories</div>
+                <div className="section-title" style={{ marginTop: user.is_admin ? 20 : 4 }}>Largest repositories</div>
                 <div className="rank">
                   {largest.map((repo) => (
                     <Link className="rank-row" key={repo.name} to={`/repositories/${repo.name}`}>
@@ -286,7 +272,7 @@ export function OverviewPage() {
         </Panel>
 
         <Panel
-          className="span-8"
+          className="span-12"
           title="Recent activity"
           actions={
             <Link className="btn sm ghost" to="/activity">
@@ -303,36 +289,6 @@ export function OverviewPage() {
           )}
         </Panel>
 
-        <Panel className="span-4" title="Push an image" description="Authenticate with an access token as the password.">
-          <div className="panel-body">
-            <ol className="steps">
-              <li>
-                <div>
-                  <strong>Sign in to the registry</strong>
-                  <CommandBox command={`docker login ${host} -u ${user.username}`} />
-                </div>
-              </li>
-              <li>
-                <div>
-                  <strong>Tag your image</strong>
-                  <CommandBox command={`docker tag app ${host}/team/app:1.0`} />
-                </div>
-              </li>
-              <li>
-                <div>
-                  <strong>Push</strong>
-                  <CommandBox command={`docker push ${host}/team/app:1.0`} />
-                </div>
-              </li>
-            </ol>
-          </div>
-          <div className="panel-foot">
-            <span>Need a password?</span>
-            <Link className="btn sm" to="/security/tokens?create=1">
-              <KeyRound size={13} /> Create token
-            </Link>
-          </div>
-        </Panel>
       </div>
     </>
   );
@@ -376,53 +332,6 @@ function ActivityChart({ buckets }: { buckets: ReturnType<typeof dailyCounts> })
         <span>{fmt(buckets[Math.floor(buckets.length / 2)].date)}</span>
         <span>Today</span>
       </div>
-    </>
-  );
-}
-
-export function StatusPage() {
-  const { data, error, reload } = useResource<Overview>("/api/v1/overview");
-  if (error) return <ErrorState message={error} onRetry={reload} />;
-  if (!data) return <Skeleton rows={4} />;
-  const rows = healthRows(data);
-  const tones = rows.map((row) => healthTone(row.status));
-  const worst = tones.includes("fail") ? "fail" : tones.includes("warn") ? "warn" : "ok";
-  return (
-    <>
-      <PageHeader
-        title="System status"
-        description="Readiness of the services this registry depends on."
-        actions={
-          <button className="btn" onClick={reload}>
-            Refresh
-          </button>
-        }
-      />
-      <section className="panel" style={{ marginBottom: 16 }}>
-        <div className="status-hero">
-          <span className={`big-dot ${worst}`}>{worst === "ok" ? <CheckCircle2 size={20} /> : <XCircle size={20} />}</span>
-          <div>
-            <h2>{worst === "ok" ? "All systems operational" : worst === "warn" ? "Some systems are degraded" : "A dependency is down"}</h2>
-            <p>
-              Up for {formatDuration(data.uptime_seconds)} · checked <RelativeTime value={Math.floor(Date.now() / 1000)} />
-            </p>
-          </div>
-        </div>
-      </section>
-      <Panel title="Components">
-        <div className="health">
-          {rows.map((row) => (
-            <div className="health-row" key={row.name} style={{ padding: "14px 18px" }}>
-              <span className="muted" style={{ display: "grid" }}>{row.icon}</span>
-              <span className="name">
-                <strong style={{ fontWeight: 500 }}>{row.name}</strong>
-                <div className="muted" style={{ fontSize: 12.5 }}>{row.detail}</div>
-              </span>
-              <StatusBadge dot state={healthTone(row.status)} label={healthLabel(row.status)} />
-            </div>
-          ))}
-        </div>
-      </Panel>
     </>
   );
 }

@@ -41,7 +41,6 @@ pub fn router(state: AppState) -> Router {
         .route("/readyz", get(readyz))
         .route("/health/live", get(livez))
         .route("/health/ready", get(readyz))
-        .route("/metrics", get(metrics))
         .route("/v2/", get(distribution_version))
         .route("/v2/{*path}", any(oci_route))
         .route("/auth/token", get(token))
@@ -194,31 +193,30 @@ async fn request_id(mut request: Request<Body>, next: Next) -> Response {
     response
 }
 
-async fn index(State(state): State<AppState>) -> impl IntoResponse {
-    Json(
-        json!({"service": "knotree-registry", "version": env!("CARGO_PKG_VERSION"), "uptime_seconds": state.started_at.elapsed().as_secs()}),
-    )
+async fn index() -> impl IntoResponse {
+    Json(json!({"service": "knotree-registry"}))
 }
 
 async fn livez() -> impl IntoResponse {
     Json(json!({"status": "ok"}))
 }
 
-async fn metrics(State(state): State<AppState>) -> impl IntoResponse {
-    (
-        [(CONTENT_TYPE, "text/plain; version=0.0.4".to_owned())],
-        state.metrics.render_prometheus(),
-    )
-}
-
+/// Public readiness: only up or not. Which component failed is logged and
+/// served on the cluster-only internal listener, never to the internet.
 async fn readyz(State(state): State<AppState>) -> impl IntoResponse {
     let readiness = state.readiness().await;
-    let status = if readiness.status == "ok" {
-        StatusCode::OK
-    } else {
-        StatusCode::SERVICE_UNAVAILABLE
-    };
-    (status, Json(readiness))
+    if readiness.status == "ok" {
+        return (StatusCode::OK, Json(json!({"status": "ok"})));
+    }
+    tracing::warn!(
+        storage = readiness.storage,
+        database = readiness.database,
+        "registry not ready"
+    );
+    (
+        StatusCode::SERVICE_UNAVAILABLE,
+        Json(json!({"status": "not_ready"})),
+    )
 }
 
 async fn distribution_version(State(state): State<AppState>, headers: HeaderMap) -> Response {
@@ -878,11 +876,14 @@ fn upload_error(error: crate::UploadError) -> Response {
             "BLOB_UPLOAD_INVALID",
             "upload is no longer active",
         ),
-        crate::UploadError::Storage(_) => oci_error(
-            StatusCode::INTERNAL_SERVER_ERROR,
-            "UNKNOWN",
-            "storage failure",
-        ),
+        crate::UploadError::Storage(error) => {
+            tracing::error!(%error, "upload storage failure");
+            oci_error(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "UNKNOWN",
+                "upload could not be stored",
+            )
+        }
     }
 }
 
@@ -915,7 +916,7 @@ async fn manifest_response(
             return oci_error(
                 StatusCode::INTERNAL_SERVER_ERROR,
                 "UNKNOWN",
-                "storage failure",
+                "manifest is temporarily unavailable",
             );
         }
     };
@@ -961,7 +962,7 @@ async fn blob_response(
             return oci_error(
                 StatusCode::INTERNAL_SERVER_ERROR,
                 "UNKNOWN",
-                "storage failure",
+                "blob is temporarily unavailable",
             );
         }
     };
@@ -988,17 +989,19 @@ async fn blob_response(
 
 fn edge_blob_redirect(state: &AppState, digest: &Digest) -> Response {
     let Some(base_url) = state.config.edge_download_url.as_deref() else {
+        tracing::error!("edge pull mode has no EDGE_DOWNLOAD_URL");
         return oci_error(
             StatusCode::SERVICE_UNAVAILABLE,
             "BLOB_UNKNOWN",
-            "edge pull mode is not configured",
+            "blob is temporarily unavailable",
         );
     };
     let Some(secret) = state.config.edge_download_secret.as_deref() else {
+        tracing::error!("edge pull mode has no EDGE_DOWNLOAD_SECRET");
         return oci_error(
             StatusCode::SERVICE_UNAVAILABLE,
             "BLOB_UNKNOWN",
-            "edge pull mode is not configured",
+            "blob is temporarily unavailable",
         );
     };
     let expires_at = SystemTime::now()
@@ -1012,7 +1015,7 @@ fn edge_blob_redirect(state: &AppState, digest: &Digest) -> Response {
         return oci_error(
             StatusCode::INTERNAL_SERVER_ERROR,
             "UNKNOWN",
-            "edge grant signer is invalid",
+            "blob is temporarily unavailable",
         );
     };
     signer.update(canonical.as_bytes());
@@ -1291,7 +1294,6 @@ async fn overview(
     if !user.is_admin {
         events.retain(|event| event.actor.as_deref() == Some(user.username.as_str()));
     }
-    let health = state.readiness().await;
     Ok(Json(json!({
         "user": user,
         "repository_count": inventory.repository_count,
@@ -1301,8 +1303,6 @@ async fn overview(
         "unreferenced_bytes": inventory.unreferenced_bytes,
         "active_token_count": credentials.iter().filter(|credential| credential.revoked_at.is_none()).count(),
         "events": events,
-        "health": health,
-        "uptime_seconds": state.started_at.elapsed().as_secs(),
     })))
 }
 
@@ -1321,16 +1321,11 @@ async fn instance(
         },
         None => "registry.knotree.com".to_owned(),
     };
+    // Only what a client needs to push and pull. Storage, environment and
+    // serving topology stay private to the operator.
     Ok(Json(json!({
         "public_url": state.config.public_url,
         "registry_host": host,
-        "environment": format!("{:?}", state.config.environment).to_ascii_lowercase(),
-        "storage_backend": format!("{:?}", state.config.storage_backend).to_ascii_lowercase(),
-        "storage_bucket": state.config.r2_bucket,
-        "pull_mode": format!("{:?}", state.config.pull_mode).to_ascii_lowercase(),
-        "token_service": state.config.token_service,
-        "token_ttl_seconds": state.config.token_ttl_seconds,
-        "registration": "closed",
     })))
 }
 
@@ -1791,6 +1786,65 @@ pub(crate) mod tests {
         let repositories = data["repositories"].as_array().unwrap();
         assert_eq!(repositories.len(), 1);
         assert_eq!(repositories[0]["name"], own.as_str());
+    }
+
+    #[tokio::test]
+    async fn public_routes_never_describe_storage_or_runtime_internals() {
+        let mut config = test_config();
+        config.r2_bucket = Some("operator-private-bucket".to_owned());
+        let state = AppState::initialize(config).await.unwrap();
+        // Admins get the same answer: the dashboard is not an ops console.
+        let session = state
+            .auth
+            .login_federated_as("https://accounts.knotree.com", "admin-subject", true)
+            .await
+            .unwrap();
+        assert!(session.user.is_admin);
+        let app = router(state);
+        let secrets = [
+            "operator-private-bucket",
+            "storage_backend",
+            "storage_bucket",
+            "pull_mode",
+            "token_service",
+            "environment",
+            "development",
+            "memory",
+            "database",
+            "uptime",
+            "version",
+        ];
+        for path in ["/", "/readyz", "/api/v1/instance", "/api/v1/overview"] {
+            let response = app
+                .clone()
+                .oneshot(
+                    Request::builder()
+                        .uri(path)
+                        .header("cookie", format!("kntr_session={}", session.token))
+                        .body(Body::empty())
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(response.status(), StatusCode::OK, "{path}");
+            let body = to_bytes(response.into_body(), 1024 * 1024).await.unwrap();
+            let text = String::from_utf8(body.to_vec())
+                .unwrap()
+                .to_ascii_lowercase();
+            for secret in secrets {
+                assert!(!text.contains(secret), "{path} leaks {secret}: {text}");
+            }
+        }
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .uri("/metrics")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::NOT_FOUND);
     }
 
     #[tokio::test]

@@ -20,8 +20,18 @@ R2 contains immutable content-addressed bytes. Preserve the bucket and its lifec
 ## Health and observability
 
 - `/livez` only tests process liveness.
-- `/readyz` checks storage and the configured database.
-- `/metrics` exposes request and response-class counters in Prometheus text format.
+- `/readyz` checks storage and the configured database but only answers
+  `{"status":"ok"}` (200) or `{"status":"not_ready"}` (503). Which component
+  failed is logged as `registry not ready`.
+- The cluster-only internal listener (`INTERNAL_BIND_ADDR`) serves operator
+  detail: `/internal/v1/health` (storage, database, uptime, version) and
+  `/metrics` (request and response-class counters, Prometheus text format).
+  Neither is routed through the public ingress.
+
+The public API and dashboard never describe the deployment: no storage
+provider, bucket, blob-serving mode, environment, component health, uptime or
+version. Storage and edge errors reach clients as generic messages and are
+logged in full on the server.
 - Every response includes `X-Request-Id`; pass a trusted incoming ID through the reverse proxy or let the service generate one.
 
 Use structured tracing at `RUST_LOG=info`. Do not log `Authorization`, cookies, PATs, webhook secrets, passwords, or R2 credentials. Scrub reverse-proxy access logs for those headers too.

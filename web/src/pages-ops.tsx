@@ -11,6 +11,7 @@ import {
   Plus,
   ScrollText,
   ShieldCheck,
+  Tags,
   Trash2,
   Upload,
   Users,
@@ -202,17 +203,19 @@ function GroupRows({ day, events, onSelect }: { day: string; events: AuditEvent[
 /* ---------- storage ---------- */
 
 export function StoragePage() {
-  const { instance, user } = useSession();
+  const { user } = useSession();
   const { data, error, reload } = useResource<StorageOverview>("/api/v1/storage");
   if (error) return <ErrorState message={error} onRetry={reload} />;
   if (!data) return <Skeleton stats />;
   const sorted = [...data.repositories].sort((left, right) => (right.size ?? 0) - (left.size ?? 0));
   const share = (bytes: number) => (data.total_bytes ? Math.round((bytes / data.total_bytes) * 1000) / 10 : 0);
+  const tagCount = data.repositories.reduce((sum, repo) => sum + (repo.tag_count ?? 0), 0);
+  const manifestCount = data.repositories.reduce((sum, repo) => sum + (repo.manifest_count ?? 0), 0);
   return (
     <>
       <PageHeader
         title="Storage"
-        description="What's in object storage, and which repositories use the most."
+        description="How much space your images use, and which repositories use the most."
         actions={
           user.is_admin && data.unreferenced_bytes > 0 ? (
             <Link className="btn" to="/operations/garbage-collection">
@@ -222,15 +225,24 @@ export function StoragePage() {
         }
       />
       <Stats
-        items={[
-          { label: "Total stored", icon: <HardDrive />, ...splitBytes(data.total_bytes) },
-          { label: "Referenced", icon: <Layers />, ...splitBytes(data.referenced_bytes), detail: `${share(data.referenced_bytes)}% of total` },
-          { label: "Unreferenced", icon: <Trash2 />, ...splitBytes(data.unreferenced_bytes), detail: `${share(data.unreferenced_bytes)}% · reclaimable` },
-          { label: "Repositories", icon: <Box />, value: data.repository_count }
-        ]}
+        items={
+          user.is_admin
+            ? [
+                { label: "Total stored", icon: <HardDrive />, ...splitBytes(data.total_bytes) },
+                { label: "Referenced", icon: <Layers />, ...splitBytes(data.referenced_bytes), detail: `${share(data.referenced_bytes)}% of total` },
+                { label: "Unreferenced", icon: <Trash2 />, ...splitBytes(data.unreferenced_bytes), detail: `${share(data.unreferenced_bytes)}% · reclaimable` },
+                { label: "Repositories", icon: <Box />, value: data.repository_count }
+              ]
+            : [
+                { label: "Total stored", icon: <HardDrive />, ...splitBytes(data.total_bytes) },
+                { label: "Repositories", icon: <Box />, value: data.repository_count },
+                { label: "Tags", icon: <Tags />, value: tagCount },
+                { label: "Manifests", icon: <Layers />, value: manifestCount }
+              ]
+        }
       />
       <div className="grid">
-        <Panel className="span-8" title="By repository" description="Sorted by stored size.">
+        <Panel className={user.is_admin ? "span-8" : "span-12"} title="By repository" description="Sorted by stored size.">
           {sorted.length ? (
             <div className="table-wrap">
               <table className="data">
@@ -275,8 +287,8 @@ export function StoragePage() {
             <EmptyState icon={<HardDrive size={18} />} title="Nothing stored yet" text="Push an image to start using storage." />
           )}
         </Panel>
-        <div className="span-4 stack-lg">
-          <Panel title="Composition">
+        {user.is_admin && (
+          <Panel className="span-4" title="Composition" description="Unreferenced content is left behind by deleted tags and can be reclaimed.">
             <div className="panel-body">
               <Meter
                 parts={[
@@ -298,21 +310,7 @@ export function StoragePage() {
               </div>
             </div>
           </Panel>
-          {instance && (
-            <Panel title="Backend">
-              <div className="panel-body">
-                <dl className="kv compact">
-                  <dt>Provider</dt>
-                  <dd>{instance.storage_backend === "r2" ? "Cloudflare R2" : instance.storage_backend}</dd>
-                  <dt>Bucket</dt>
-                  <dd className="mono">{instance.storage_bucket ?? "local"}</dd>
-                  <dt>Blob serving</dt>
-                  <dd className="mono">{instance.pull_mode}</dd>
-                </dl>
-              </div>
-            </Panel>
-          )}
-        </div>
+        )}
       </div>
     </>
   );
@@ -738,41 +736,37 @@ export function SecuritySettingsPage() {
 }
 
 export function SettingsPage() {
-  const { instance } = useSession();
+  const { instance, host, user } = useSession();
   if (!instance) return <Skeleton rows={6} />;
+  const copyable = (value: string) => (
+    <span className="row" style={{ gap: 4 }}>
+      <span className="mono">{value}</span>
+      <CopyButton value={value} />
+    </span>
+  );
   const groups: { title: string; description: string; rows: [string, React.ReactNode][] }[] = [
     {
-      title: "Instance",
-      description: "Identity of this registry.",
+      title: "Registry",
+      description: "Where Docker and other OCI clients push and pull.",
       rows: [
-        ["Token service", <span className="mono">{instance.token_service}</span>],
-        ["Environment", <StatusBadge state="neutral" label={instance.environment} />],
-        ["Public URL", <span className="row" style={{ gap: 4 }}><span className="mono">{instance.public_url}</span><CopyButton value={instance.public_url} /></span>],
-        ["Registry host", <span className="row" style={{ gap: 4 }}><span className="mono">{instance.registry_host}</span><CopyButton value={instance.registry_host} /></span>]
+        ["Registry host", copyable(host)],
+        ["Web address", copyable(instance.public_url)],
+        ["Sign in", copyable(`docker login ${host} -u ${user.username}`)]
       ]
     },
     {
       title: "Access",
       description: "How people and machines get in.",
       rows: [
-        ["Registration", instance.registration === "closed" ? "Closed — only administrators add accounts" : instance.registration],
         ["Web sign-in", "Knotree Accounts (SSO)"],
-        ["Registry token lifetime", `${formatDuration(instance.token_ttl_seconds)} (${instance.token_ttl_seconds}s)`]
-      ]
-    },
-    {
-      title: "Storage",
-      description: "Where image content lives.",
-      rows: [
-        ["Backend", instance.storage_backend === "r2" ? "Cloudflare R2" : instance.storage_backend],
-        ["Bucket", <span className="mono">{instance.storage_bucket ?? "—"}</span>],
-        ["Blob serving", <span className="mono">{instance.pull_mode}</span>]
+        ["Docker and CI", <span>Access tokens, used as the password. <Link to="/security/tokens">Manage tokens</Link></span>],
+        ["Repository visibility", "Private — pulls need your account or an access token"]
       ]
     }
   ];
   return (
     <>
-      <PageHeader title="Settings" description="Read-only. These values come from the server's environment and change on redeploy." />
+      <PageHeader title="Settings" description="Connection details for this registry." />
       <div className="stack-lg">
         {groups.map((group) => (
           <Panel key={group.title} title={group.title} description={group.description}>

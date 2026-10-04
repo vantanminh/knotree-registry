@@ -343,13 +343,25 @@ impl Catalog {
         for digest in manifest_candidates.keys() {
             match store.delete(&crate::manifest_key(digest)).await {
                 Ok(()) | Err(StorageError::NotFound) => {}
-                Err(error) => report.failures.push(format!("manifest {digest}: {error}")),
+                Err(error) => {
+                    // Storage errors name the backend; keep them in the log only.
+                    tracing::error!(%digest, %error, "gc failed to delete manifest");
+                    report
+                        .failures
+                        .push(format!("manifest {digest}: delete failed"));
+                }
             }
         }
         for digest in &blob_candidates {
             match store.delete(&crate::blob_key(digest)).await {
                 Ok(()) | Err(StorageError::NotFound) => {}
-                Err(error) => report.failures.push(format!("blob {digest}: {error}")),
+                Err(error) => {
+                    // Storage errors name the backend; keep them in the log only.
+                    tracing::error!(%digest, %error, "gc failed to delete blob");
+                    report
+                        .failures
+                        .push(format!("blob {digest}: delete failed"));
+                }
             }
         }
         if report.failures.is_empty() {
